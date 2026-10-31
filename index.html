@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+    <meta name="theme-color" content="#141627" />
+    <meta name="description" content="TinyPuzzle — 上传一张图片，在浏览器里把它变成你的拼图" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <title>TinyPuzzle · 在线拼图</title>
+  </head>
+  <body>
+    <!-- 首页：上传 / 示例图 / 继续上局 -->
+    <section id="view-home" class="view">
+      <div class="home-inner">
+        <header class="hero">
+          <div class="logo" aria-hidden="true">🧩</div>
+          <h1>TinyPuzzle</h1>
+          <p class="tagline">上传一张图片，把它变成你的拼图</p>
+        </header>
+
+        <div id="resume-card" class="resume-card hidden">
+          <img id="resume-thumb" alt="上局图片缩略图" />
+          <div class="resume-info">
+            <b>继续上局</b>
+            <span id="resume-meta"></span>
+          </div>
+          <button id="btn-resume" class="btn btn-primary" type="button">继续</button>
+          <button id="btn-discard" class="icon-btn" type="button" title="放弃并清除" aria-label="放弃并清除进度">✕</button>
+        </div>
+
+        <div class="upload-card" id="drop-zone">
+          <label class="btn btn-primary" for="file-input" id="upload-label">选择图片</label>
+          <input type="file" id="file-input" accept="image/png,image/jpeg,image/webp" hidden />
+          <p class="drop-hint">或将图片拖到这里 · 支持 PNG / JPG / WebP</p>
+
+          <div class="divider"><span>或选择示例图</span></div>
+          <div class="sample-grid" id="sample-grid"></div>
+        </div>
+
+        <p class="privacy-note">🔒 图片仅在你的浏览器本地处理，不会上传到任何服务器</p>
+      </div>
+    </section>
+
+    <!-- 难度设置页 -->
+    <section id="view-setup" class="view hidden">
+      <header class="setup-bar">
+        <button id="btn-setup-back" class="btn btn-ghost" type="button">‹ 重新选图</button>
+      </header>
+      <div class="setup-inner">
+        <div class="setup-preview">
+          <img id="setup-thumb" alt="拼图预览" />
+          <div id="setup-grid" class="setup-grid grid-lines"></div>
+        </div>
+        <h2>选择难度</h2>
+        <div class="preset-grid" id="preset-grid"></div>
+        <div class="custom-row">
+          <label>行 <select id="sel-rows"></select></label>
+          <span class="times">×</span>
+          <label>列 <select id="sel-cols"></select></label>
+          <span id="piece-count" class="piece-count"></span>
+        </div>
+        <button id="btn-start" class="btn btn-primary btn-lg" type="button">开始拼图</button>
+      </div>
+    </section>
+
+    <!-- 游戏页 -->
+    <section id="view-game" class="view hidden">
+      <header class="game-bar">
+        <button id="btn-back" class="btn btn-ghost" type="button">‹ 换一张图</button>
+        <div class="game-stats">
+          <span id="stat-time">00:00</span>
+          <i>·</i>
+          <span id="stat-moves">0 步</span>
+          <i>·</i>
+          <b id="progress">0/9</b>
+        </div>
+        <div class="game-actions">
+          <button id="btn-hint" class="icon-btn" type="button" title="原图参考">👁</button>
+          <button id="btn-lock" class="icon-btn" type="button" title="吸附锁定">🔒</button>
+          <button id="btn-sound" class="icon-btn" type="button" title="音效">🔊</button>
+          <button id="btn-restart" class="btn btn-ghost" type="button">重新打乱</button>
+        </div>
+      </header>
+      <main class="board-wrap" id="board-wrap">
+        <div id="board" class="grid-lines">
+          <div id="hint-overlay" class="hint-overlay hidden"></div>
+          <div id="drop-hint" class="cell-hint hidden"></div>
+        </div>
+      </main>
+    </section>
+
+    <!-- 结算弹层 -->
+    <div id="result-overlay" class="overlay hidden">
+      <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="result-title">
+        <div class="emoji" aria-hidden="true">🎉</div>
+        <h2 id="result-title">拼图完成！</h2>
+        <p id="result-sub">用时 00:00 · 0 步</p>
+        <p id="result-records" class="result-records"></p>
+        <div class="dialog-actions">
+          <button id="btn-again" class="btn btn-primary" type="button">再玩一次</button>
+          <button id="btn-change" class="btn btn-ghost" type="button">换一张图</button>
+        </div>
+      </div>
+    </div>
+
+    <canvas id="confetti"></canvas>
+    <div id="toast" role="status"></div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
