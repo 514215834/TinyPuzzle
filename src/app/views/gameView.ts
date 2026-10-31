@@ -19,9 +19,22 @@ const ENTER_MS = 950;
 /** 进度快照节流间隔 */
 const SAVE_THROTTLE_MS = 400;
 /** 吸附阈值系数（架构文档 §7.5） */
-const SNAP_RATIO = 0.35;
+/** 自由摆放吸附容差（占格子边长比例）：靠近正确格松手即自动归位（F-302） */
+const SNAP_RATIO = 0.6;
 /** 提示次数上限（F-304） */
 const MAX_HINTS = 3;
+
+/** 网格编码：列字母 + 行号（0,0→A1，1,0→B1，0,1→A2，26 列起 AA…） */
+function cellCode(col: number, row: number): string {
+  let n = col + 1;
+  let s = '';
+  while (n > 0) {
+    n -= 1;
+    s = String.fromCharCode(65 + (n % 26)) + s;
+    n = Math.floor(n / 26);
+  }
+  return s + String(row + 1);
+}
 
 /** 游戏页（F-003~F-007 / F-101~F-106 / F-201~F-206 / F-301~F-305） */
 export class GameView {
@@ -37,6 +50,7 @@ export class GameView {
   private readonly btnSound: HTMLButtonElement;
   private readonly btnHint: HTMLButtonElement;
   private readonly btnLock: HTMLButtonElement;
+  private readonly btnCode: HTMLButtonElement;
   private readonly btnHelp: HTMLButtonElement;
   private readonly btnShare: HTMLButtonElement;
 
@@ -61,6 +75,8 @@ export class GameView {
   private readonly onResize = (): void => {
     this.fitBoard();
     this.clampAllFreePos();
+    this.clampPan();
+    this.applyViewport();
   };
   private readonly onVisibility = (): void => {
     if (!this.engine || this.engine.isSolved) return;
@@ -86,6 +102,7 @@ export class GameView {
     this.btnSound = must(root.querySelector<HTMLButtonElement>('#btn-sound'), '#btn-sound');
     this.btnHint = must(root.querySelector<HTMLButtonElement>('#btn-hint'), '#btn-hint');
     this.btnLock = must(root.querySelector<HTMLButtonElement>('#btn-lock'), '#btn-lock');
+    this.btnCode = must(root.querySelector<HTMLButtonElement>('#btn-code'), '#btn-code');
     this.btnHelp = must(root.querySelector<HTMLButtonElement>('#btn-help'), '#btn-help');
     this.btnShare = must(document.querySelector<HTMLButtonElement>('#btn-share'), '#btn-share');
 
@@ -119,14 +136,201 @@ export class GameView {
       if (this.engine) this.engine.lockOnSnap = this.settings.lockOnSnap;
       this.syncToggleButtons();
     });
+    this.btnCode.addEventListener('click', () => {
+      this.settings = saveSettings({ gridCodes: !this.settings.gridCodes });
+      this.renderCellCodes();
+      this.syncToggleButtons();
+    });
     this.btnHelp.addEventListener('click', () => this.useHint());
 
     window.addEventListener('keydown', this.onKeyDown);
     window.addEventListener('resize', this.onResize);
     document.addEventListener('visibilitychange', this.onVisibility);
+    this.wrap.addEventListener('wheel', this.onWheel, { passive: false });
+    this.wrap.addEventListener('pointerdown', this.onViewportPointerDown);
+    this.wrap.addEventListener('pointermove', this.onViewportPointerMove);
+    this.wrap.addEventListener('pointerup', this.onViewportPointerUp);
+    this.wrap.addEventListener('pointercancel', this.onViewportPointerUp);
+    // 双击翻面查看背面编码（编码开关开启时）
+    this.board.addEventListener('dblclick', this.onBoardDblClick);
   }
 
-  // ---------- 键盘无障碍（F-402，交换式玩法） ----------
+  // ---------- 网格 / 拼图编码（默认关） ----------
+
+  private readonly onBoardDblClick = (e: MouseEvent): void => {
+    if (!this.engine || this.animating || !this.settings.gridCodes) return;
+    const el = this.pickAt(e.clientX, e.clientY);
+    if (!el) return;
+    this.toggleFlip(Number(el.dataset.pieceId));
+  };
+
+  /** 双击翻面：显示背面（背面印有该块的正确格编码） */
+  private toggleFlip(pieceId: number): void {
+    const el = this.pieceEl(pieceId);
+    const p = this.engine?.piece(pieceId);
+    if (!el || !p) return;
+    let back = el.querySelector<HTMLElement>('.piece-back');
+    if (!back) {
+      back = document.createElement('div');
+      back.className = 'piece-back';
+      const cols = this.cols;
+      back.textContent = cellCode(p.id % cols, Math.floor(p.id / cols));
+      back.style.fontSize = `${Math.max(9, Math.round((this.board.offsetWidth / cols) * 0.34))}px`;
+      el.appendChild(back);
+    }
+    const flipped = el.classList.toggle('flipped');
+    el.dataset.flipped = flipped ? '1' : '0';
+    this.restTransform(el);
+    playTone('pick', this.settings.soundOn);
+  }
+
+
+  /** 渲染 / 隐藏网格编码层（A1、B3…） */
+  private renderCellCodes(): void {
+    const layer = document.getElementById('cell-codes');
+    if (!layer) return;
+    if (!this.settings.gridCodes || !this.engine) {
+      layer.classList.add('hidden');
+      layer.innerHTML = '';
+      return;
+    }
+    const { w: lw } = this.localSize();
+    const fs = Math.max(7, Math.round((lw / this.cols) * 0.24));
+    layer.style.fontSize = `${fs}px`;
+    layer.style.gridTemplateColumns = `repeat(${this.cols}, 1fr)`;
+    layer.style.gridTemplateRows = `repeat(${this.rows}, 1fr)`;
+    const frag = document.createDocumentFragment();
+    for (let r = 0; r < this.rows; r++) {
+      for (let c = 0; c < this.cols; c++) {
+        const span = document.createElement('span');
+        span.textContent = cellCode(c, r);
+        frag.appendChild(span);
+      }
+    }
+    layer.innerHTML = '';
+    layer.appendChild(frag);
+    layer.classList.remove('hidden');
+  }
+
+  // ---------- 视口缩放 / 平移（拼图区域支持滚轮 / 双指缩放、空白拖拽平移） ----------
+
+  private zoom = 1;
+  private panX = 0;
+  private panY = 0;
+  /** 视口手势进行中的指针集合（不含落在拼图块上的指针） */
+  private viewportPointers = new Map<number, { x: number; y: number }>();
+
+  private static readonly ZOOM_MIN = 0.5;
+  private static readonly ZOOM_MAX = 6;
+
+  /** 棋盘视觉缩放系数（client px / 局部 px） */
+  private scaleFactor(): number {
+    const rect = this.board.getBoundingClientRect();
+    return rect.width / (this.board.offsetWidth || 1);
+  }
+
+  private applyViewport(): void {
+    this.board.style.transformOrigin = '0 0';
+    this.board.style.transform = `translate(${this.panX}px, ${this.panY}px) scale(${this.zoom})`;
+  }
+
+  private resetViewport(): void {
+    this.zoom = 1;
+    this.panX = 0;
+    this.panY = 0;
+    this.viewportPointers.clear();
+    this.applyViewport();
+  }
+
+  /** 以某个屏幕点为锚缩放（保持该点下的棋盘内容不动） */
+  private zoomAt(clientX: number, clientY: number, factor: number): void {
+    if (!this.engine) return;
+    const rect = this.board.getBoundingClientRect();
+    const layoutLeft = rect.left - this.panX;
+    const layoutTop = rect.top - this.panY;
+    const next = Math.min(GameView.ZOOM_MAX, Math.max(GameView.ZOOM_MIN, this.zoom * factor));
+    if (next === this.zoom) return;
+    const localX = (clientX - layoutLeft - this.panX) / this.zoom;
+    const localY = (clientY - layoutTop - this.panY) / this.zoom;
+    this.zoom = next;
+    this.panX = clientX - layoutLeft - localX * this.zoom;
+    this.panY = clientY - layoutTop - localY * this.zoom;
+    this.clampPan();
+    this.applyViewport();
+  }
+
+  /** 平移夹取：棋盘至少保留 60px 与场地相交；棋盘小于场地时居中 */
+  private clampPan(): void {
+    if (!this.engine) return;
+    const wrapRect = this.wrap.getBoundingClientRect();
+    const rect = this.board.getBoundingClientRect();
+    const layoutLeft = rect.left - this.panX;
+    const layoutTop = rect.top - this.panY;
+    const bw = this.board.offsetWidth * this.zoom;
+    const bh = this.board.offsetHeight * this.zoom;
+    const margin = 60;
+    const clampAxis = (layout: number, size: number, wrapStart: number, wrapSize: number, pan: number): number => {
+      const min = wrapStart + margin - layout - size;
+      const max = wrapStart + wrapSize - margin - layout;
+      if (min > max) return wrapStart + wrapSize / 2 - layout - size / 2;
+      return Math.min(max, Math.max(min, pan));
+    };
+    this.panX = clampAxis(layoutLeft, bw, wrapRect.left, wrapRect.width, this.panX);
+    this.panY = clampAxis(layoutTop, bh, wrapRect.top, wrapRect.height, this.panY);
+  }
+
+  private readonly onWheel = (e: WheelEvent): void => {
+    if (!this.engine) return;
+    e.preventDefault();
+    this.zoomAt(e.clientX, e.clientY, Math.exp(-e.deltaY * 0.0015));
+  };
+
+  private readonly onViewportPointerDown = (e: PointerEvent): void => {
+    if (!this.engine) return;
+    if ((e.target as HTMLElement | null)?.closest('.piece')) return; // 拼图块交给 DragController
+    this.viewportPointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (this.viewportPointers.size === 1) e.preventDefault();
+  };
+
+  private readonly onViewportPointerMove = (e: PointerEvent): void => {
+    if (!this.engine || !this.viewportPointers.has(e.pointerId)) return;
+    if (this.controller?.dragging) {
+      this.viewportPointers.delete(e.pointerId);
+      return;
+    }
+    const prev = this.viewportPointers.get(e.pointerId)!;
+    const curr = { x: e.clientX, y: e.clientY };
+    this.viewportPointers.set(e.pointerId, curr);
+    e.preventDefault();
+
+    if (this.viewportPointers.size >= 2) {
+      // 双指捏合：以另一指为锚，张缩比缩放、质心位移平移
+      const others = [...this.viewportPointers.entries()].filter(([id]) => id !== e.pointerId).map(([, p]) => p);
+      const anchor = others[0] ?? prev;
+      const dist0 = Math.hypot(anchor.x - prev.x, anchor.y - prev.y) || 1;
+      const dist1 = Math.hypot(anchor.x - curr.x, anchor.y - curr.y) || 1;
+      const cent0 = { x: (anchor.x + prev.x) / 2, y: (anchor.y + prev.y) / 2 };
+      const cent1 = { x: (anchor.x + curr.x) / 2, y: (anchor.y + curr.y) / 2 };
+      this.zoomAt(cent1.x, cent1.y, dist1 / dist0);
+      this.panX += cent1.x - cent0.x;
+      this.panY += cent1.y - cent0.y;
+      this.clampPan();
+      this.applyViewport();
+      return;
+    }
+
+    // 单指 / 鼠标：空白处拖拽平移
+    this.panX += curr.x - prev.x;
+    this.panY += curr.y - prev.y;
+    this.clampPan();
+    this.applyViewport();
+  };
+
+  private readonly onViewportPointerUp = (e: PointerEvent): void => {
+    this.viewportPointers.delete(e.pointerId);
+  };
+
+  // ---------- 键盘无障碍（F-402，交换式玩法）+ 旋转快捷键 ----------
 
   /** 光标所在格（null = 未激活） */
   private cursorCell: number | null = null;
@@ -135,10 +339,24 @@ export class GameView {
 
   private readonly onKeyDown = (e: KeyboardEvent): void => {
     if (!this.engine || this.engine.isSolved || this.animating) return;
-    if (this.session?.opts.mode !== 'swap') return; // 自由摆放以指针交互为主
     const target = e.target as HTMLElement | null;
     if (target && ['INPUT', 'SELECT', 'TEXTAREA'].includes(target.tagName)) return;
 
+    // 旋转快捷键：Q 逆时针 / E、R 顺时针；拖拽中的块随时可转
+    const key = e.key.toLowerCase();
+    if (key === 'q' || key === 'e' || key === 'r') {
+      const held = this.controller?.heldPieceId ?? null;
+      if (held !== null) {
+        e.preventDefault();
+        const rot = this.engine.rotatePiece(held, key === 'q' ? -1 : 1);
+        this.controller!.refreshHeldRot(rot);
+        playTone('drop', this.settings.soundOn);
+        this.scheduleSave();
+        return;
+      }
+    }
+
+    if (this.session?.opts.mode !== 'swap') return; // 其余键盘操作仅交换式玩法
     const move = (dc: number, dr: number): void => {
       e.preventDefault();
       const base = this.cursorCell ?? this.firstMovableCell();
@@ -168,9 +386,23 @@ export class GameView {
         break;
       case 'r':
       case 'R':
+      case 'e':
+      case 'E':
+      case 'q':
+      case 'Q':
         if (this.session?.opts.rotationEnabled) {
           const id = this.heldId ?? this.movableAt(this.cursorCell);
-          if (id !== null) this.rotate(id);
+          if (id !== null) {
+            e.preventDefault();
+            const rot = this.engine.rotatePiece(id, key === 'q' ? -1 : 1);
+            const el = this.pieceEl(id);
+            if (el) {
+              el.dataset.rot = String(rot);
+              this.restTransform(el);
+            }
+            playTone('drop', this.settings.soundOn);
+            this.scheduleSave();
+          }
         }
         break;
       case 'h':
@@ -274,11 +506,17 @@ export class GameView {
     this.board.setAttribute('aria-label', t('boardAria'));
     this.cursorCell = null;
     this.heldId = null;
+    this.resetViewport();
     this.hintEl.style.backgroundImage = `url("${session.stage.dataUrl}")`;
     this.hintEl.style.opacity = String(this.settings.hintOpacity);
     this.applyHint();
     this.syncToggleButtons();
 
+    // 先量好棋盘尺寸再散布：#board 的尺寸只能来自 fitBoard 的内联样式，
+    // 否则 scatterFree 测到 0 宽会推迟散布，buildPieces→syncPieces 立即同步执行
+    // 就会因 freePos 为空而中断挂载（首次进入自由摆放必现）
+    this.fitBoard();
+    this.renderCellCodes();
     // 自由摆放：恢复或重新散布
     this.freePos.clear();
     if (mode === 'free') {
@@ -290,6 +528,7 @@ export class GameView {
     }
 
     await this.buildPieces();
+    if (!this.session || !this.engine) return; // 构建期间被卸载，不再继续挂载
     this.controller = new DragController(this.board, { rows: this.rows, cols: this.cols }, {
       canPick: this.canPick,
       pickAt: this.pickAt,
@@ -297,7 +536,6 @@ export class GameView {
       hoverChange: this.hoverChange,
       rotate: rotationEnabled ? this.rotate : undefined,
     });
-    this.fitBoard();
     this.clampAllFreePos();
     this.saveProgressNow();
 
@@ -318,6 +556,9 @@ export class GameView {
     this.shapes = null;
     this.freePos.clear();
     this.animating = false;
+    const cellCodes = document.getElementById('cell-codes');
+    if (cellCodes) cellCodes.classList.add('hidden');
+    this.resetViewport();
     window.clearTimeout(this.saveTimer);
     for (const t of this.timers) window.clearInterval(t);
     this.timers = [];
@@ -337,6 +578,7 @@ export class GameView {
     if (this.session?.opts.shape === 'classic') {
       this.spec = buildShapeSpec(this.rows, this.cols, stage.width, stage.height);
       this.shapes = await buildPieceShapes(this.spec, stage.dataUrl);
+      if (!this.session || !this.engine) return; // 切图期间被卸载（如地狱难度切图较慢时返回）
     } else {
       this.spec = null;
       this.shapes = null;
@@ -348,11 +590,27 @@ export class GameView {
       el.dataset.pieceId = String(p.id);
       el.dataset.rot = String(p.rot);
       this.applyPieceGeometry(el, p.id);
-      el.style.animationDelay = `${p.id * 18}ms`;
+      // 大块数下按总量压缩入场间隔，整体入场控制在约 1.2s 内
+      const step = Math.min(18, Math.max(1, Math.round(1200 / engine.getPieces().length)));
+      el.style.animationDelay = `${p.id * step}ms`;
       el.addEventListener('animationend', () => el.classList.remove('enter'), { once: true });
       this.board.appendChild(el);
     }
     this.syncPieces();
+  }
+
+  /** 异形块画布四周的 margin 留白（棋盘宽度百分比）：元素定位需反向偏移，格子部分才与网格线对齐 */
+  private marginPct(): { mx: number; my: number } {
+    const stage = this.session?.stage;
+    if (!this.spec || !stage) return { mx: 0, my: 0 };
+    return { mx: (this.spec.margin / stage.width) * 100, my: (this.spec.margin / stage.height) * 100 };
+  }
+
+  /** 同上，按棋盘像素计（用于 px 定位与命中/吸附判定的坐标修正） */
+  private marginPx(rect: { width: number; height: number }): { mx: number; my: number } {
+    const stage = this.session?.stage;
+    if (!this.spec || !stage) return { mx: 0, my: 0 };
+    return { mx: (this.spec.margin / stage.width) * rect.width, my: (this.spec.margin / stage.height) * rect.height };
   }
 
   /** 按形状/模式设置块的尺寸与初始位置 */
@@ -360,8 +618,7 @@ export class GameView {
     const stage = must(this.session, '对局参数缺失').stage;
     if (this.shapes && this.spec) {
       const shape = this.shapes[id];
-      const mx = (this.spec.margin / stage.width) * 100;
-      const my = (this.spec.margin / stage.height) * 100;
+      const { mx, my } = this.marginPct();
       el.classList.add('shaped');
       el.style.width = `${100 / this.cols + mx * 2}%`;
       el.style.height = `${100 / this.rows + my * 2}%`;
@@ -379,13 +636,14 @@ export class GameView {
   }
 
   private restTransform(el: HTMLElement): void {
-    const rot = Number(el.dataset.rot ?? 0);
-    el.style.transform = rot ? `rotate(${rot * 90}deg)` : '';
+    el.style.transform = this.poseSuffix(el).trim();
   }
 
   /** 以引擎状态全量同步 DOM */
   private syncPieces(): void {
-    const engine = must(this.engine, '引擎未初始化');
+    const engine = this.engine;
+    if (!engine) return; // 已卸载（延迟回调可能晚于 unmount 触发）
+    const { mx, my } = this.marginPct(); // 异形块元素含留白，定位需反向偏移
     for (const p of engine.getPieces()) {
       const el = this.pieceEl(p.id);
       if (!el) continue;
@@ -394,7 +652,8 @@ export class GameView {
       el.classList.toggle('locked', p.locked);
       el.style.zIndex = p.locked ? '0' : '1';
       if (this.session?.opts.mode === 'free' && p.cell < 0) {
-        const pos = must(this.freePos.get(p.id), '自由块缺少位置');
+        const pos = this.freePos.get(p.id);
+        if (!pos) continue; // 散布尚未完成（棋盘未量到尺寸），等散布后的补同步，不致命
         el.style.left = `${pos.x}px`;
         el.style.top = `${pos.y}px`;
         el.dataset.cell = '-1';
@@ -403,8 +662,8 @@ export class GameView {
       } else {
         const col = p.cell % this.cols;
         const row = Math.floor(p.cell / this.cols);
-        el.style.left = `${(col * 100) / this.cols}%`;
-        el.style.top = `${(row * 100) / this.rows}%`;
+        el.style.left = `${(col * 100) / this.cols - mx}%`;
+        el.style.top = `${(row * 100) / this.rows - my}%`;
         el.dataset.cell = String(p.cell);
       }
     }
@@ -467,8 +726,10 @@ export class GameView {
       const sin = Math.sin(rad);
       [dx, dy] = [dx * cos - dy * sin, dx * sin + dy * cos];
     }
-    const lx = ((dx + hw) / (hw * 2)) * shape.canvas.width;
-    const ly = ((dy + hh) / (hh * 2)) * shape.canvas.height;
+    // 画布背板为高清采样，路径坐标是逻辑尺寸，需按倍率换算
+    const cscale = shape.scale || 1;
+    const lx = ((dx + hw) / (hw * 2)) * (shape.canvas.width / cscale);
+    const ly = ((dy + hh) / (hh * 2)) * (shape.canvas.height / cscale);
     return ctx.isPointInPath(shape.path, lx, ly);
   }
 
@@ -515,39 +776,72 @@ export class GameView {
     return outcome;
   };
 
-  /** 自由摆放落子（F-302）：仅正确格 + 朝向正确才吸附 */
+  /** 目标格是否被其他块占用（自由摆放吸附前置校验） */
+  private cellOccupied(cell: number, exceptPieceId: number): boolean {
+    return !!this.engine?.getPieces().some((q) => q.cell === cell && q.id !== exceptPieceId);
+  }
+
+  /** 元素当前未变换位置的棋盘坐标（格上块按百分比定位，散置块按 px 定位） */
+  private elementPosPx(el: HTMLElement, boardWidth: number, boardHeight: number): { x: number; y: number } {
+    const lx = parseFloat(el.style.left);
+    const ly = parseFloat(el.style.top);
+    return {
+      x: Number.isFinite(lx) && el.style.left.endsWith('%') ? (lx / 100) * boardWidth : Number.isFinite(lx) ? lx : 0,
+      y: Number.isFinite(ly) && el.style.top.endsWith('%') ? (ly / 100) * boardHeight : Number.isFinite(ly) ? ly : 0,
+    };
+  }
+
+  /**
+   * 松手接续动画：把元素瞬移到最终位置，同时用位移把视觉接回松手点，
+   * 随后平滑滑入目标格。避免「left 瞬变 + 拖拽位移残留」造成的抖动。
+   */
+  private settleTo(el: HTMLElement, pieceId: number, dx: number, dy: number, oldLeft: number, oldTop: number, left: number, top: number, z: string): void {
+    el.style.left = `${left}px`;
+    el.style.top = `${top}px`;
+    el.dataset.px = String(left);
+    el.dataset.py = String(top);
+    this.freePos.delete(pieceId);
+    this.jumpTo(el, `translate3d(${oldLeft + dx - left}px, ${oldTop + dy - top}px, 0) scale(1.04)${this.poseSuffix(el)}`);
+    el.style.zIndex = z;
+    this.animating = true;
+    this.rAF(() => {
+      el.style.transform = this.poseSuffix(el); // 滑入最终姿态，朝向全程保持
+    });
+    this.later(() => {
+      this.animating = false;
+      this.syncPieces();
+    }, ANIM_MS);
+  }
+
+  /** 自由摆放落子（F-302）：正确格吸附锁定；落在棋盘内吸附到所在格；其余原地散置 */
   private handleFreeDrop(pieceId: number, dx: number, dy: number, cx: number, cy: number): void {
     const engine = must(this.engine, '引擎未初始化');
     const el = must(this.pieceEl(pieceId), '拖拽块元素缺失');
-    const rect = this.board.getBoundingClientRect();
-    const cw = rect.width / this.cols;
-    const ch = rect.height / this.rows;
+    const { w: lw, h: lh } = this.localSize();
+    const cw = lw / this.cols;
+    const ch = lh / this.rows;
+    const { mx, my } = this.marginPx({ width: lw, height: lh });
     const p = engine.piece(pieceId);
+    const { x: oldLeft, y: oldTop } = this.elementPosPx(el, lw, lh);
+
+    // 拖拽回调的 cx/cy 坐标基准分两种（见 DragController.centerOf）：
+    // 格上块按格中心（已含 margin 修正）；散置块按元素左上角（需加回 margin 才是格子部分中心）
+    const off = p.cell < 0 ? { x: mx, y: my } : { x: 0, y: 0 };
+    const px = cx + off.x;
+    const py = cy + off.y;
 
     const ccx = ((p.id % this.cols) + 0.5) * cw;
     const ccy = (Math.floor(p.id / this.cols) + 0.5) * ch;
     const threshold = SNAP_RATIO * Math.min(cw, ch);
     const rotOk = !engine.rotationEnabled || p.rot === 0;
 
-    if (Math.hypot(cx - ccx, cy - ccy) < threshold && rotOk) {
+    // 1) 靠近正确格 + 朝向正确 + 该格空闲 → 吸附归位并锁定
+    if (Math.hypot(px - ccx, py - ccy) < threshold && rotOk && !this.cellOccupied(p.id, pieceId)) {
       const outcome = engine.lockPiece(pieceId);
       engine.countMove();
-      // 从当前视觉位置滑入正确格
-      const oldLeft = Number(el.dataset.px ?? 0);
-      const oldTop = Number(el.dataset.py ?? 0);
-      const newLeft = ccx - cw / 2;
-      const newTop = ccy - ch / 2;
-      this.freePos.delete(pieceId);
-      this.jumpTo(el, `translate3d(${oldLeft + dx - newLeft}px, ${oldTop + dy - newTop}px, 0) scale(1.04)`);
-      el.style.zIndex = '30';
-      this.animating = true;
-      this.rAF(() => {
-        el.style.transform = '';
-      });
-      this.later(() => {
-        this.animating = false;
-        this.syncPieces();
-      }, ANIM_MS);
+      const newLeft = ccx - cw / 2 - mx;
+      const newTop = ccy - ch / 2 - my;
+      this.settleTo(el, pieceId, dx, dy, oldLeft, oldTop, newLeft, newTop, '30');
       if (outcome.type === 'solved') {
         clearProgress();
         this.later(() => this.celebrate(), ANIM_MS);
@@ -559,21 +853,43 @@ export class GameView {
       return;
     }
 
-    // 未命中：原地散置（夹取到场地范围内）
-    const wrapRect = this.wrap.getBoundingClientRect();
-    const boardRect = this.board.getBoundingClientRect();
+    // 2) 落点在棋盘内、目标格空闲 → 吸附到该格（网格对齐，不锁定）
+    const col = Math.min(this.cols - 1, Math.max(0, Math.floor(px / cw)));
+    const row = Math.min(this.rows - 1, Math.max(0, Math.floor(py / ch)));
+    const onBoard = px >= 0 && px <= lw && py >= 0 && py <= lh;
+    const target = row * this.cols + col;
+    if (onBoard && target !== p.cell && !this.cellOccupied(target, pieceId)) {
+      engine.placeOnCell(pieceId, target);
+      engine.countMove();
+      const cellLeft = col * cw - mx;
+      const cellTop = row * ch - my;
+      this.settleTo(el, pieceId, dx, dy, oldLeft, oldTop, cellLeft, cellTop, '20');
+      playTone('drop', this.settings.soundOn);
+      this.scheduleSave();
+      return;
+    }
+
+    // 3) 原地散置（含从格上拖出棋盘的情形）：引擎状态与视觉同步为散置
+    // 点击未拖动的格上块视为无操作（避免误散置，也给双击翻面让路）
+    const moved = Math.hypot(dx, dy) > 2;
+    if (p.cell >= 0 && !moved && px >= 0 && px <= lw && py >= 0 && py <= lh) {
+      this.restTransform(el);
+      return;
+    }
+    if (p.cell >= 0) engine.scatterPiece(pieceId);
+    const field = this.fieldRect();
     const box = this.freePieceBox();
-    const fx = wrapRect.left - boardRect.left;
-    const fy = wrapRect.top - boardRect.top;
-    const clampedX = Math.min(Math.max(Number(el.dataset.px ?? 0) + dx, fx), fx + wrapRect.width - box.w);
-    const clampedY = Math.min(Math.max(Number(el.dataset.py ?? 0) + dy, fy), fy + wrapRect.height - box.h);
+    const clampedX = Math.min(Math.max(oldLeft + dx, field.fx), field.fx + field.fw - box.w);
+    const clampedY = Math.min(Math.max(oldTop + dy, field.fy), field.fy + field.fh - box.h);
     this.freePos.set(pieceId, { x: clampedX, y: clampedY });
     el.style.left = `${clampedX}px`;
     el.style.top = `${clampedY}px`;
     el.dataset.cell = '-1';
     el.dataset.px = String(clampedX);
     el.dataset.py = String(clampedY);
-    this.restTransform(el);
+    // 瞬时清掉拖拽位移（left 已是最终位置，视觉无跳变），随后平滑缩回
+    this.jumpTo(el, `scale(1.04)${this.poseSuffix(el)}`);
+    this.rAF(() => this.restTransform(el));
     this.later(() => this.syncPieces(), ANIM_MS);
     playTone('drop', this.settings.soundOn);
     this.scheduleSave();
@@ -585,14 +901,34 @@ export class GameView {
       return;
     }
     if (this.session?.opts.mode === 'free') {
-      // 自由摆放：仅当接近该块的正确格时高亮
-      const rect = this.board.getBoundingClientRect();
-      const cw = rect.width / this.cols;
-      const ch = rect.height / this.rows;
-      const ccx = ((info.pieceId % this.cols) + 0.5) * cw;
-      const ccy = (Math.floor(info.pieceId / this.cols) + 0.5) * ch;
-      if (Math.hypot(info.cx - ccx, info.cy - ccy) < SNAP_RATIO * Math.min(cw, ch)) {
-        this.showCellHint(info.pieceId);
+      // 自由摆放：高亮「松手后会吸附的格」——靠近的正确格，或落点所在空格（与吸附判定同一坐标基准）
+      const engine = this.engine;
+      if (!engine) return;
+      const { w: lw, h: lh } = this.localSize();
+      const cw = lw / this.cols;
+      const ch = lh / this.rows;
+      const { mx, my } = this.marginPx({ width: lw, height: lh });
+      const p = engine.piece(info.pieceId);
+      const off = p.cell < 0 ? { x: mx, y: my } : { x: 0, y: 0 };
+      const px = info.cx + off.x;
+      const py = info.cy + off.y;
+      const rotOk = !engine.rotationEnabled || p.rot === 0;
+      const ccx = ((p.id % this.cols) + 0.5) * cw;
+      const ccy = (Math.floor(p.id / this.cols) + 0.5) * ch;
+      if (
+        Math.hypot(px - ccx, py - ccy) < SNAP_RATIO * Math.min(cw, ch) &&
+        rotOk &&
+        !this.cellOccupied(p.id, p.id)
+      ) {
+        this.showCellHint(p.id);
+        return;
+      }
+      const onBoard = px >= 0 && px <= lw && py >= 0 && py <= lh;
+      const col = Math.min(this.cols - 1, Math.max(0, Math.floor(px / cw)));
+      const row = Math.min(this.rows - 1, Math.max(0, Math.floor(py / ch)));
+      const target = row * this.cols + col;
+      if (onBoard && target !== p.cell && !this.cellOccupied(target, p.id)) {
+        this.showCellHint(target);
       } else {
         this.hideCellHint();
       }
@@ -674,9 +1010,9 @@ export class GameView {
     dx: number,
     dy: number,
   ): void {
-    const rect = this.board.getBoundingClientRect();
-    const cw = rect.width / this.cols;
-    const ch = rect.height / this.rows;
+    const { w: lw, h: lh } = this.localSize();
+    const cw = lw / this.cols;
+    const ch = lh / this.rows;
     const px = (cell: number) => ({
       x: (cell % this.cols) * cw,
       y: Math.floor(cell / this.cols) * ch,
@@ -703,9 +1039,14 @@ export class GameView {
     }, ANIM_MS);
   }
 
-  private rotSuffix(el: HTMLElement): string {
+  /** 静止姿态后缀：朝向旋转 + 背面翻面（与 restTransform 一致） */
+  private poseSuffix(el: HTMLElement): string {
     const rot = Number(el.dataset.rot ?? 0);
-    return rot ? ` rotate(${rot * 90}deg)` : '';
+    return (rot ? ` rotate(${rot * 90}deg)` : '') + (el.dataset.flipped === '1' ? ' rotateY(180deg)' : '');
+  }
+
+  private rotSuffix(el: HTMLElement): string {
+    return this.poseSuffix(el);
   }
 
   private jumpTo(el: HTMLElement, transform: string): void {
@@ -826,6 +1167,9 @@ export class GameView {
     this.btnLock.textContent = this.settings.lockOnSnap ? '🔒' : '🔓';
     this.btnLock.title = this.settings.lockOnSnap ? t('titleLockOn') : t('titleLockOff');
     this.btnLock.classList.toggle('off', !this.settings.lockOnSnap);
+    this.btnCode.textContent = 'A1';
+    this.btnCode.title = this.settings.gridCodes ? t('titleGridOn') : t('titleGridOff');
+    this.btnCode.classList.toggle('active', this.settings.gridCodes);
   }
 
   // ---------- 操作入口 ----------
@@ -873,28 +1217,56 @@ export class GameView {
 
   // ---------- 自由摆放散布 ----------
 
+  /** 棋盘局部像素尺寸（layout 单位；块定位、散布、吸附判定全部使用该坐标系） */
+  private localSize(): { w: number; h: number } {
+    return { w: this.board.offsetWidth, h: this.board.offsetHeight };
+  }
+
   /** 自由模式下块的实际占位（含异形留白），用于散布与夹取 */
   private freePieceBox(): { w: number; h: number } {
-    const rect = this.board.getBoundingClientRect();
+    const { w: lw } = this.localSize();
     const stage = must(this.session, '对局参数缺失').stage;
-    const scale = rect.width / stage.width;
+    const scale = lw / stage.width;
     const m = (this.spec?.margin ?? 0) * scale;
-    return { w: rect.width / this.cols + m * 2, h: rect.height / this.rows + m * 2 };
+    return { w: lw / this.cols + m * 2, h: this.localSize().h / this.rows + m * 2 };
+  }
+
+  /**
+   * 散落场地：以棋盘为中心四周各外扩 50%（棋盘的 2 倍见方）的局部坐标区域，
+   * 至少覆盖整个可见视口。配合缩放 / 平移，散落块可分布在视口之外，
+   * 场地与当前视口位置无关（平移 / 缩放后再夹取不会漂移）。
+   */
+  private fieldRect(): { fx: number; fy: number; fw: number; fh: number; lw: number; lh: number } {
+    const wrapRect = this.wrap.getBoundingClientRect();
+    const scale = this.scaleFactor();
+    const { w: lw, h: lh } = this.localSize();
+    const viewW = wrapRect.width / scale;
+    const viewH = wrapRect.height / scale;
+    const fw = Math.max(lw * 2, viewW);
+    const fh = Math.max(lh * 2, viewH);
+    return {
+      fx: (lw - fw) / 2,
+      fy: (lh - fh) / 2,
+      fw,
+      fh,
+      lw,
+      lh,
+    };
   }
 
   /** 把未归位块随机散布在棋盘四周的场地内（避开棋盘区域） */
   private scatterFree(): void {
-    const rect = this.board.getBoundingClientRect();
-    const wrapRect = this.wrap.getBoundingClientRect();
-    if (rect.width === 0 || wrapRect.width === 0) {
-      this.rAF(() => this.scatterFree());
+    if (!this.engine || !this.session) return;
+    if (this.localSize().w === 0 || this.wrap.getBoundingClientRect().width === 0) {
+      this.rAF(() => {
+        if (!this.engine) return; // 已卸载
+        this.scatterFree();
+        this.syncPieces(); // 散布完成后补一次同步，把块摆到散布位置
+      });
       return;
     }
+    const field = this.fieldRect();
     const box = this.freePieceBox();
-    const fx = wrapRect.left - rect.left; // 场地左缘（棋盘坐标，≤0）
-    const fy = wrapRect.top - rect.top;
-    const fw = wrapRect.width;
-    const fh = wrapRect.height;
     const engine = must(this.engine, '引擎未初始化');
     for (const p of engine.getPieces()) {
       if (p.cell >= 0) continue;
@@ -902,10 +1274,10 @@ export class GameView {
       let y = 0;
       let ok = false;
       for (let attempt = 0; attempt < 50 && !ok; attempt++) {
-        x = fx + Math.random() * Math.max(fw - box.w, 1);
-        y = fy + Math.random() * Math.max(fh - box.h, 1);
+        x = field.fx + Math.random() * Math.max(field.fw - box.w, 1);
+        y = field.fy + Math.random() * Math.max(field.fh - box.h, 1);
         // 避开棋盘区域（留 6px 缓冲）
-        const intersects = x + box.w > 6 && x < rect.width - 6 && y + box.h > 6 && y < rect.height - 6;
+        const intersects = x + box.w > 6 && x < field.lw - 6 && y + box.h > 6 && y < field.lh - 6;
         ok = !intersects;
       }
       this.freePos.set(p.id, { x, y });
@@ -915,18 +1287,15 @@ export class GameView {
   /** 视口尺寸变化后把散布块夹回场地内 */
   private clampAllFreePos(): void {
     if (this.session?.opts.mode !== 'free' || !this.engine) return;
-    const rect = this.board.getBoundingClientRect();
-    const wrapRect = this.wrap.getBoundingClientRect();
-    if (rect.width === 0 || wrapRect.width === 0) return;
+    if (this.localSize().w === 0 || this.wrap.getBoundingClientRect().width === 0) return;
     const box = this.freePieceBox();
-    const fx = wrapRect.left - rect.left;
-    const fy = wrapRect.top - rect.top;
+    const field = this.fieldRect();
     for (const p of this.engine.getPieces()) {
       if (p.cell >= 0) continue;
       const pos = this.freePos.get(p.id);
       if (!pos) continue;
-      pos.x = Math.min(Math.max(pos.x, fx), fx + wrapRect.width - box.w);
-      pos.y = Math.min(Math.max(pos.y, fy), fy + wrapRect.height - box.h);
+      pos.x = Math.min(Math.max(pos.x, field.fx), field.fx + field.fw - box.w);
+      pos.y = Math.min(Math.max(pos.y, field.fy), field.fy + field.fh - box.h);
       const el = this.pieceEl(p.id);
       if (el) {
         el.style.left = `${pos.x}px`;

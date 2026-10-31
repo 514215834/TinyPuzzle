@@ -29,9 +29,11 @@
         </div>
 
         <div class="upload-card" id="drop-zone">
-          <label class="btn btn-primary" for="file-input" id="upload-label" data-i18n="chooseImage">选择图片</label>
-          <input type="file" id="file-input" accept="image/png,image/jpeg,image/webp" hidden />
-          <p class="drop-hint" data-i18n="dropHint">或将图片拖到这里 · 支持 PNG / JPG / WebP</p>
+          <div class="dropzone">
+            <label class="btn btn-primary" for="file-input" id="upload-label" data-i18n="chooseImage">选择图片</label>
+            <input type="file" id="file-input" accept="image/png,image/jpeg,image/webp" hidden />
+            <p class="drop-hint" data-i18n="dropHint">或将图片拖到这里 · 支持 PNG / JPG / WebP</p>
+          </div>
 
           <div class="divider"><span data-i18n="orPickSample">或选择示例图</span></div>
           <div class="sample-grid" id="sample-grid"></div>
@@ -53,28 +55,6 @@
         </div>
         <h2 data-i18n="setupTitle">选择难度</h2>
         <div class="preset-grid" id="preset-grid"></div>
-        <div class="custom-row">
-          <label><span data-i18n="rows">行</span> <select id="sel-rows"></select></label>
-          <span class="times">×</span>
-          <label><span data-i18n="cols">列</span> <select id="sel-cols"></select></label>
-          <span id="piece-count" class="piece-count"></span>
-        </div>
-        <div class="option-rows">
-          <div class="option-row">
-            <span class="option-label" data-i18n="optShape">形状</span>
-            <button type="button" class="opt-btn active" data-shape="square" data-i18n="shapeSquare">方块</button>
-            <button type="button" class="opt-btn" data-shape="classic" data-i18n="shapeClassic">经典凹凸</button>
-          </div>
-          <div class="option-row">
-            <span class="option-label" data-i18n="optMode">玩法</span>
-            <button type="button" class="opt-btn active" data-mode="swap" data-i18n="modeSwap">交换拼合</button>
-            <button type="button" class="opt-btn" data-mode="free" data-i18n="modeFree">自由摆放</button>
-          </div>
-          <div class="option-row" id="opt-rotation-wrap">
-            <span class="option-label" data-i18n="optAdvanced">进阶</span>
-            <button type="button" class="opt-btn" id="opt-rotation">🔄 旋转模式：关</button>
-          </div>
-        </div>
         <button id="btn-start" class="btn btn-primary btn-lg" type="button" data-i18n="start">开始拼图</button>
       </div>
     </section>
@@ -92,6 +72,7 @@
         </div>
         <div class="game-actions">
           <button id="btn-help" class="icon-btn" type="button" title="提示">💡3</button>
+          <button id="btn-code" class="icon-btn" type="button" title="网格编码">A1</button>
           <button id="btn-hint" class="icon-btn" type="button" title="原图参考">👁</button>
           <button id="btn-lock" class="icon-btn" type="button" title="吸附锁定">🔒</button>
           <button id="btn-sound" class="icon-btn" type="button" title="音效">🔊</button>
@@ -100,6 +81,7 @@
       </header>
       <main class="board-wrap" id="board-wrap">
         <div id="board" class="grid-lines">
+          <div id="cell-codes" class="cell-codes hidden"></div>
           <div id="hint-overlay" class="hint-overlay hidden"></div>
           <div id="drop-hint" class="cell-hint hidden"></div>
         </div>

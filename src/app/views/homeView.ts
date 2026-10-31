@@ -61,6 +61,14 @@ export function initHomeView(handlers: HomeHandlers): { show: () => void; hide: 
     if (file) handleFile(file);
   });
 
+  // 点击虚线上传区任意位置即可选图（label 自带打开行为，避免二次触发）；
+  // 仅限定在虚线区内：示例图 / 继续上局等区域不触发文件选择
+  dropZone.addEventListener('click', (e) => {
+    if (!(e.target as HTMLElement).closest('.dropzone')) return;
+    if ((e.target as HTMLElement).closest('#upload-label')) return;
+    input.click();
+  });
+
   dropZone.addEventListener('dragover', (e) => {
     e.preventDefault();
     dropZone.classList.add('dragover');

@@ -70,6 +70,29 @@ describe('PuzzleEngine（交换式）', () => {
     expect(engine.isSolved).toBe(false);
   });
 
+  it('reshuffle：自由摆放重新散置（cell = -1），与开局一致（F-302）', () => {
+    const engine = PuzzleEngine.create(3, 3, { mode: 'free' }, mulberry32(2));
+    engine.lockPiece(4);
+    expect(engine.piece(4).cell).toBe(4);
+    engine.reshuffle(mulberry32(3));
+    expect(engine.moves).toBe(0);
+    expect(engine.getPieces().every((p) => p.cell === -1 && !p.locked)).toBe(true);
+    expect(engine.getAssignment().every((v) => v === -1)).toBe(true);
+  });
+
+  it('自由摆放：placeOnCell 停任意格不锁定，scatterPiece 拿回散置', () => {
+    const engine = PuzzleEngine.create(3, 3, { mode: 'free' }, mulberry32(2));
+    engine.placeOnCell(0, 5);
+    expect(engine.piece(0).cell).toBe(5);
+    expect(engine.piece(0).locked).toBe(false);
+    expect(engine.placedCount).toBe(0);
+    // 位置不对不算归位，但占用会体现在进度快照里
+    expect(engine.getAssignment()[5]).toBe(0);
+    engine.scatterPiece(0);
+    expect(engine.piece(0).cell).toBe(-1);
+    expect(engine.getAssignment().every((v) => v === -1)).toBe(true);
+  });
+
   it('大棋盘（10×10）可创建并打乱', () => {
     const engine = PuzzleEngine.create(10, 10, {}, mulberry32(4));
     expect(engine.getPieces()).toHaveLength(100);

@@ -13,22 +13,37 @@ import type { EdgeParams, ShapeSpec } from './shapeTypes';
 type Pt = [number, number];
 type Seg = [Pt, Pt, Pt, Pt]; // [P0, C1, C2, P3]
 
-/** 蘑菇形凸舌：5 段三次贝塞尔，凸出方向 = +u 乘 sign */
+/**
+ * 经典拼图凸舌：8 段三次贝塞尔，真实拼图的蘑菇卡口造型。
+ *
+ * 造型要点（相对边长 L 的横向比例、相对 S 的纵向比例）：
+ * - 基线平直引入/引出，肩部从 c±2.1w 开始起势；
+ * - 颈部收窄（最窄 c±0.95w，高于基线 0.36h），形成上窄下宽的脖颈；
+ * - 头部外翻（最宽 c±1.5w，高于基线 0.66h），颈部明显窄于头部 → 卡口 undercut；
+ * - 头顶圆拱，端点切线水平，保证相邻边衔接光滑；
+ * - 相邻块共享同一边参数，反向描边天然互补。
+ */
 export function tabSegments(p: EdgeParams): Seg[] {
   const s = p.sign;
   const { c, w, h } = p;
   const u = (v: number): number => v * s;
   return [
-    // 基线引入
-    [[0, 0], [c * 0.5, u(-0.04)], [c - 2.4 * w, u(0.06)], [c - 1.6 * w, u(0)]],
-    // 左颈外翻（形成卡口）
-    [[c - 1.6 * w, u(0)], [c - 2.2 * w, u(0.34 * h)], [c - 1.9 * w, u(0.72 * h)], [c - 0.5 * w, u(0.78 * h)]],
-    // 头部拱顶
-    [[c - 0.5 * w, u(0.78 * h)], [c - 0.16 * w, u(1.18 * h)], [c + 0.16 * w, u(1.18 * h)], [c + 0.5 * w, u(0.78 * h)]],
-    // 右颈
-    [[c + 0.5 * w, u(0.78 * h)], [c + 1.9 * w, u(0.72 * h)], [c + 2.2 * w, u(0.34 * h)], [c + 1.6 * w, u(0)]],
-    // 基线引出
-    [[c + 1.6 * w, u(0)], [c + 2.4 * w, u(0.06)], [1 - c * 0.5, u(-0.04)], [1, 0]],
+    // 基线引入（平直）
+    [[0, 0], [0.12, 0], [c - 2.9 * w, 0], [c - 2.1 * w, 0]],
+    // 起势入颈：切线从水平转竖直，向中心收窄
+    [[c - 2.1 * w, u(0)], [c - 1.25 * w, u(0)], [c - 0.95 * w, u(0.16 * h)], [c - 0.95 * w, u(0.36 * h)]],
+    // 外翻形成卡口（head undercut：头部最宽 > 颈部）
+    [[c - 0.95 * w, u(0.36 * h)], [c - 0.95 * w, u(0.52 * h)], [c - 1.5 * w, u(0.54 * h)], [c - 1.5 * w, u(0.66 * h)]],
+    // 左上圆拱
+    [[c - 1.5 * w, u(0.66 * h)], [c - 1.5 * w, u(0.86 * h)], [c - 0.58 * w, u(h)], [c, u(h)]],
+    // 右上圆拱
+    [[c, u(h)], [c + 0.58 * w, u(h)], [c + 1.5 * w, u(0.86 * h)], [c + 1.5 * w, u(0.66 * h)]],
+    // 右侧卡口收回
+    [[c + 1.5 * w, u(0.66 * h)], [c + 1.5 * w, u(0.54 * h)], [c + 0.95 * w, u(0.52 * h)], [c + 0.95 * w, u(0.36 * h)]],
+    // 出颈下行
+    [[c + 0.95 * w, u(0.36 * h)], [c + 0.95 * w, u(0.16 * h)], [c + 1.25 * w, u(0)], [c + 2.1 * w, u(0)]],
+    // 基线引出（平直）
+    [[c + 2.1 * w, u(0)], [c + 2.9 * w, u(0)], [0.88, 0], [1, 0]],
   ];
 }
 
@@ -72,8 +87,8 @@ export function buildShapeSpec(
   const edge = (): EdgeParams => ({
     sign: rng() < 0.5 ? 1 : -1,
     c: rand(0.44, 0.56),
-    w: rand(0.09, 0.12),
-    h: rand(0.2, 0.26),
+    w: rand(0.085, 0.115),
+    h: rand(0.21, 0.26),
   });
   const hEdges: (EdgeParams | null)[][] = [];
   for (let r = 0; r <= rows; r++) {
@@ -143,9 +158,11 @@ export function buildPiecePath(spec: ShapeSpec, pieceId: number): Path2D {
 export interface BuiltPieceShape {
   canvas: HTMLCanvasElement;
   path: Path2D;
+  /** 画布实际像素 / 逻辑像素 比（高清采样倍率，命中测试换算用） */
+  scale: number;
 }
 
-/** 载入舞台图并为每块生成离屏切片 + 命中路径 */
+/** 载入舞台图并为每块生成离屏切片 + 命中路径（按块数 2~3 倍超采样，缩放查看不模糊） */
 export async function buildPieceShapes(
   spec: ShapeSpec,
   stageDataUrl: string,
@@ -157,14 +174,17 @@ export async function buildPieceShapes(
   const { rows, cols, stageW, stageH, margin } = spec;
   const cw = stageW / cols;
   const ch = stageH / rows;
+  // 超采样倍率：≤1200 块用 3×，更多用 2×（平衡清晰度与显存）
+  const dpr = rows * cols > 1200 ? 2 : 3;
   const out: BuiltPieceShape[] = [];
   for (let id = 0; id < rows * cols; id++) {
     const path = buildPiecePath(spec, id);
     const canvas = document.createElement('canvas');
-    canvas.width = Math.round(cw + margin * 2);
-    canvas.height = Math.round(ch + margin * 2);
+    canvas.width = Math.round((cw + margin * 2) * dpr);
+    canvas.height = Math.round((ch + margin * 2) * dpr);
     const ctx = canvas.getContext('2d');
     if (!ctx) throw new Error('Canvas 2D 上下文不可用');
+    ctx.scale(dpr, dpr); // 路径与绘制保持逻辑坐标，背板高清
     const r = Math.floor(id / cols);
     const c = id % cols;
     // 路径已是画布局部坐标：直接裁剪；源矩形显式取「格子外扩 margin 与舞台的交集」
@@ -185,7 +205,7 @@ export async function buildPieceShapes(
     ctx.strokeStyle = 'rgba(255, 255, 255, 0.22)';
     ctx.lineWidth = 1;
     ctx.stroke(path);
-    out.push({ canvas, path });
+    out.push({ canvas, path, scale: dpr });
   }
   return out;
 }

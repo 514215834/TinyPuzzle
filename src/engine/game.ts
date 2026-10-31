@@ -125,10 +125,24 @@ export class PuzzleEngine {
     return this.isSolved ? { type: 'solved' } : { type: 'placed' };
   }
 
-  /** 旋转一块（F-303）；停放在正确格的块会因朝向变化解除锁定 */
-  rotatePiece(pieceId: number): number {
+  /** 自由摆放：停到指定格（不判正确性；占用校验由视图层负责），永不锁定 */
+  placeOnCell(pieceId: number, cell: number): void {
     const p = this.piece(pieceId);
-    p.rot = (p.rot + 1) % 4;
+    p.cell = cell;
+    p.locked = false;
+  }
+
+  /** 自由摆放：从格上拿回散置（cell = -1） */
+  scatterPiece(pieceId: number): void {
+    const p = this.piece(pieceId);
+    p.cell = -1;
+    p.locked = false;
+  }
+
+  /** 旋转一块（F-303）：dir=1 顺时针、-1 逆时针；停放在正确格的块会因朝向变化解除锁定 */
+  rotatePiece(pieceId: number, dir: 1 | -1 = 1): number {
+    const p = this.piece(pieceId);
+    p.rot = (p.rot + (dir === 1 ? 1 : 3)) % 4;
     p.locked = this.lockOnSnap && p.cell === p.id && (!this.rotationEnabled || p.rot === 0);
     return p.rot;
   }
@@ -136,7 +150,11 @@ export class PuzzleEngine {
   /** 同图重新打乱（F-107），步数与进度一并重置 */
   reshuffle(rng: () => number = Math.random): void {
     const rots = this.rotationEnabled ? randomRots(this.rows * this.cols, rng) : undefined;
-    this.pieces = buildPieces(shuffledAssignment(this.rows * this.cols, rng), this.lockOnSnap, rots, this.rotationEnabled, this.mode === 'free');
+    // 自由摆放与开局一致：全部散置（cell = -1），由视图层重新散布
+    const assignment = this.mode === 'free'
+      ? new Array<number>(this.rows * this.cols).fill(-1)
+      : shuffledAssignment(this.rows * this.cols, rng);
+    this.pieces = buildPieces(assignment, this.lockOnSnap, rots, this.rotationEnabled, this.mode === 'free');
     this.movesCount = 0;
   }
 }

@@ -2,6 +2,7 @@ import './app/styles/main.css';
 import { registerSW } from 'virtual:pwa-register';
 
 import { unlockAudio } from './app/audio';
+import { fitGrid } from './app/config';
 import { applyStatic, getLang, setLang } from './app/i18n';
 import type { StageImage } from './engine/imageProcessor';
 import { loadSettings, saveSettings } from './storage/settings';
@@ -17,9 +18,11 @@ applyStatic();
 // 首次用户手势时解锁音频（浏览器自动播放策略）
 document.addEventListener('pointerdown', () => unlockAudio(), { once: true, capture: true });
 
-// 语言切换（F-403）
+// 语言切换（F-403）：按钮始终显示目标语言
 document.getElementById('btn-lang')?.addEventListener('click', () => {
   setLang(getLang() === 'zh' ? 'en' : 'zh');
+  const btnLang = document.getElementById('btn-lang');
+  if (btnLang) btnLang.textContent = getLang() === 'zh' ? 'EN' : '中文';
   home.refreshI18n();
   setup.refreshI18n();
 });
@@ -34,12 +37,14 @@ const gameView = new GameView(gameEl);
 const home = initHomeView({
   onNewStage: (stage: StageImage, meta: ImageMeta) => {
     const s = loadSettings();
+    const { rows, cols } = fitGrid(stage.ratio, s.pieceTarget);
     session = {
       stage,
       meta,
-      rows: s.rows,
-      cols: s.cols,
-      opts: { mode: s.mode, shape: s.shape, rotationEnabled: s.rotationEnabled },
+      rows,
+      cols,
+      // 玩法固定：经典凹凸 + 自由摆放 + 可旋转（不再作为设置项）
+      opts: { mode: 'free', shape: 'classic', rotationEnabled: true },
     };
     location.hash = '#/setup';
   },
@@ -61,14 +66,8 @@ const setup = initSetupView({
     if (!session) return;
     session.rows = config.rows;
     session.cols = config.cols;
-    session.opts = { mode: config.mode, shape: config.shape, rotationEnabled: config.rotationEnabled };
-    saveSettings({
-      rows: config.rows,
-      cols: config.cols,
-      shape: config.shape,
-      mode: config.mode,
-      rotationEnabled: config.rotationEnabled,
-    }); // 记忆难度与玩法（F-101/F-301/F-302/F-303）
+    session.opts = { mode: 'free', shape: 'classic', rotationEnabled: true };
+    saveSettings({ pieceTarget: config.pieceTarget }); // 记忆块数（F-101）
     location.hash = '#/play';
   },
   onBack: () => {

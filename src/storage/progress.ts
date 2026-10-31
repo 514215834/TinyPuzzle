@@ -28,7 +28,8 @@ export interface SavedProgress {
 }
 
 const KEY = 'tp.progress';
-const MAX_DIM = 10;
+/** 单边最大格数（与 config.MAX_DIM 一致，极端比例大块数网格） */
+const MAX_DIM = 220;
 
 export function loadProgress(): SavedProgress | null {
   const raw = readJson<SavedProgress>(KEY);

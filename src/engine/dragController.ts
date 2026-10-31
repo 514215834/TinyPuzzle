@@ -38,6 +38,10 @@ interface DragSession {
   startCell: number;
   target: number | null;
   moved: boolean;
+  /** 指针类型：长按旋转仅触屏生效，鼠标误触率高（按下瞄准即超时） */
+  pointerType: string;
+  lastDx: number;
+  lastDy: number;
 }
 
 const LONG_PRESS_MS = 480;
@@ -61,7 +65,6 @@ export class DragController {
     board.addEventListener('pointermove', this.onMove);
     board.addEventListener('pointerup', this.onUp);
     board.addEventListener('pointercancel', this.onCancel);
-    board.addEventListener('dblclick', this.onDblClick);
     board.addEventListener('contextmenu', this.onContextMenu);
   }
 
@@ -71,9 +74,37 @@ export class DragController {
     board.removeEventListener('pointermove', this.onMove);
     board.removeEventListener('pointerup', this.onUp);
     board.removeEventListener('pointercancel', this.onCancel);
-    board.removeEventListener('dblclick', this.onDblClick);
     board.removeEventListener('contextmenu', this.onContextMenu);
     window.clearTimeout(this.pressTimer);
+  }
+
+  /** 是否有进行中的拖拽（视图层判断是否让位给平移手势） */
+  get dragging(): boolean {
+    return this.session !== null;
+  }
+
+  /** 当前拖拽中的块 id（无则 null） */
+  get heldPieceId(): number | null {
+    return this.session?.pieceId ?? null;
+  }
+
+  /** 拖拽中键盘旋转后刷新持块姿态（Q/E 旋转） */
+  refreshHeldRot(rot: number): void {
+    const s = this.session;
+    if (!s) return;
+    s.el.dataset.rot = String(rot);
+    s.el.style.transform = `translate3d(${s.lastDx}px, ${s.lastDy}px, 0) scale(1.04)${this.currentRot(s.el)}${this.flipSuffix(s.el)}`;
+  }
+
+  /** 背面翻转态后缀（查看编码） */
+  private flipSuffix(el: HTMLElement): string {
+    return el.dataset.flipped === '1' ? ' rotateY(180deg)' : '';
+  }
+
+  /** 棋盘视觉缩放系数：client px / 棋盘局部 px（视口缩放后两者不再相等） */
+  private scaleFactor(): number {
+    const rect = this.board.getBoundingClientRect();
+    return rect.width / (this.board.offsetWidth || 1);
   }
 
   private onContextMenu = (e: Event): void => {
@@ -115,22 +146,24 @@ export class DragController {
       startCell: Number(el.dataset.cell),
       target: null,
       moved: false,
+      pointerType: e.pointerType,
+      lastDx: 0,
+      lastDy: 0,
     };
     el.classList.add('dragging');
     el.style.zIndex = '30';
     if (this.cb.rotate) {
       window.clearTimeout(this.pressTimer);
       this.pressTimer = window.setTimeout(() => {
-        if (this.session && !this.session.moved) this.cb.rotate?.(this.session.pieceId);
+        if (this.session && !this.session.moved && this.session.pointerType === 'touch') this.cb.rotate?.(this.session.pieceId);
       }, LONG_PRESS_MS);
     }
   };
 
-  /** 块中心棋盘坐标：格上块按格中心，自由散布块按像素位置 */
+  /** 块中心棋盘坐标：格上块按格中心，自由散布块按像素位置（均为局部 px） */
   private centerOf(s: DragSession, dx: number, dy: number): { cx: number; cy: number } {
-    const rect = this.board.getBoundingClientRect();
-    const cw = rect.width / this.spec.cols;
-    const ch = rect.height / this.spec.rows;
+    const cw = this.board.offsetWidth / this.spec.cols;
+    const ch = this.board.offsetHeight / this.spec.rows;
     if (s.startCell >= 0) {
       return {
         cx: ((s.startCell % this.spec.cols) + 0.5) * cw + dx,
@@ -148,20 +181,25 @@ export class DragController {
     if (!s || e.pointerId !== s.pointerId) return;
     e.preventDefault();
 
-    const dx = e.clientX - s.startX;
-    const dy = e.clientY - s.startY;
-    if (!s.moved && Math.hypot(dx, dy) > LONG_PRESS_TOLERANCE) {
+    // 位移统一换算为棋盘局部 px（client px / 缩放系数），视觉位移随缩放保持 1:1
+    const scale = this.scaleFactor();
+    const dx = (e.clientX - s.startX) / scale;
+    const dy = (e.clientY - s.startY) / scale;
+    s.lastDx = dx;
+    s.lastDy = dy;
+    if (!s.moved && Math.hypot(e.clientX - s.startX, e.clientY - s.startY) > LONG_PRESS_TOLERANCE) {
       s.moved = true;
       window.clearTimeout(this.pressTimer);
     }
     s.el.style.transform = `translate3d(${dx}px, ${dy}px, 0) scale(1.04)${this.currentRot(s.el)}`;
 
     // 以块中心判定目标格；中心拖出棋盘视为无目标
-    const rect = this.board.getBoundingClientRect();
+    const w = this.board.offsetWidth;
+    const h = this.board.offsetHeight;
     const { cx, cy } = this.centerOf(s, dx, dy);
-    const inside = cx >= 0 && cx <= rect.width && cy >= 0 && cy <= rect.height;
+    const inside = cx >= 0 && cx <= w && cy >= 0 && cy <= h;
     const hit = inside
-      ? cellAtPoint(cx, cy, rect.width, rect.height, this.spec.rows, this.spec.cols)
+      ? cellAtPoint(cx, cy, w, h, this.spec.rows, this.spec.cols)
       : null;
     const target = hit !== null && hit !== s.startCell ? hit : null;
 
@@ -176,14 +214,6 @@ export class DragController {
     return rot ? ` rotate(${rot * 90}deg)` : '';
   }
 
-  private onDblClick = (e: MouseEvent): void => {
-    if (!this.cb.rotate || this.session) return;
-    const el = this.cb.pickAt(e.clientX, e.clientY);
-    if (!el) return;
-    const pieceId = Number(el.dataset.pieceId);
-    if (this.cb.canPick(pieceId)) this.cb.rotate(pieceId);
-  };
-
   private finish(e: PointerEvent, cancelled: boolean): void {
     const s = this.session;
     if (!s || e.pointerId !== s.pointerId) return;
@@ -192,8 +222,9 @@ export class DragController {
     s.el.classList.remove('dragging');
     this.cb.hoverChange(null);
 
-    const dx = e.clientX - s.startX;
-    const dy = e.clientY - s.startY;
+    const scale = this.scaleFactor();
+    const dx = (e.clientX - s.startX) / scale;
+    const dy = (e.clientY - s.startY) / scale;
     const { cx, cy } = this.centerOf(s, dx, dy);
     const target = cancelled ? s.startCell : (s.target ?? s.startCell);
     this.cb.drop(s.pieceId, target, dx, dy, cx, cy);

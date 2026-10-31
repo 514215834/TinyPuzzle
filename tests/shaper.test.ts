@@ -24,13 +24,17 @@ describe('shaper（F-301）', () => {
 
   it('tabSegments：起止于基线两端，凸舌在 sign 方向', () => {
     const segs = tabSegments({ sign: 1, c: 0.5, w: 0.1, h: 0.23 });
-    expect(segs).toHaveLength(5);
+    expect(segs).toHaveLength(8);
     expect(segs[0][0]).toEqual([0, 0]);
-    expect(segs[4][3]).toEqual([1, 0]);
-    // 拱顶控制点在 +u 方向
-    const dome = segs[2];
+    expect(segs[7][3]).toEqual([1, 0]);
+    // 头部圆拱控制点在 +u 方向
+    const dome = segs[3];
     expect(dome[1][1]).toBeGreaterThan(0);
     expect(dome[2][1]).toBeGreaterThan(0);
+    // 卡口造型：颈部（0.36h）比头部最宽处（0.66h）更窄
+    const neck = segs[1][3][0];
+    const bulb = segs[2][3][0];
+    expect(Math.abs(bulb - 0.5)).toBeGreaterThan(Math.abs(neck - 0.5));
   });
 
   it('反向段与正向段几何互补（相邻块共享同一条曲线）', () => {

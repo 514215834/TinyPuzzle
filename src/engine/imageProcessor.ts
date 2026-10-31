@@ -1,5 +1,5 @@
 /**
- * 图片处理（F-001）：解码（含 EXIF 方向修正）→ 居中裁剪到棋盘比例 → 缩放至舞台尺寸。
+ * 图片处理（F-001）：解码（含 EXIF 方向修正）→ 按真实宽高比等比缩放至舞台尺寸（不裁剪）。
  * 全程在浏览器本地完成，无任何网络请求。
  */
 
@@ -8,38 +8,17 @@ export interface StageImage {
   dataUrl: string;
   width: number;
   height: number;
-  /** 宽高比 width / height */
+  /** 宽高比 width / height（与原图一致） */
   ratio: number;
 }
 
-/** 舞台最长边（像素），限制大图内存占用 */
-export const STAGE_MAX = 1024;
-/** 棋盘宽高比夹取范围：过扁/过长的图片居中裁剪到该范围，保证格子形状合理 */
-export const MIN_RATIO = 3 / 4;
-export const MAX_RATIO = 4 / 3;
+/** 舞台最长边（像素）；预留缩放查看的高清余量，限制大图内存占用 */
+export const STAGE_MAX = 2048;
 
 const SUPPORTED_TYPES = ['image/png', 'image/jpeg', 'image/webp'];
 
 export function isSupportedImage(file: File): boolean {
   return SUPPORTED_TYPES.includes(file.type);
-}
-
-export function clampBoardRatio(ratio: number): number {
-  return Math.min(MAX_RATIO, Math.max(MIN_RATIO, ratio));
-}
-
-/** 在原图上取居中的目标比例裁剪区（cover） */
-export function computeCrop(
-  imgW: number,
-  imgH: number,
-  ratio: number,
-): { sx: number; sy: number; sw: number; sh: number } {
-  if (imgW / imgH > ratio) {
-    const sw = imgH * ratio;
-    return { sx: (imgW - sw) / 2, sy: 0, sw, sh: imgH };
-  }
-  const sh = imgW / ratio;
-  return { sx: 0, sy: (imgH - sh) / 2, sw: imgW, sh };
 }
 
 /** 舞台像素尺寸：最长边 = STAGE_MAX */
@@ -95,32 +74,35 @@ function exportDataUrl(canvas: HTMLCanvasElement): string {
   return webp.startsWith('data:image/webp') ? webp : canvas.toDataURL('image/jpeg', 0.9);
 }
 
-/** Blob / File → 舞台图 */
+/** Blob / File → 舞台图（保留原图完整内容与真实比例） */
 export async function blobToStage(blob: Blob): Promise<StageImage> {
   const img = await decode(blob);
   try {
-    const ratio = clampBoardRatio(img.width / img.height);
-    const { w, h } = computeStageSize(ratio);
-    const { sx, sy, sw, sh } = computeCrop(img.width, img.height, ratio);
-
-    const canvas = document.createElement('canvas');
-    canvas.width = Math.round(w);
-    canvas.height = Math.round(h);
-    const ctx = canvas.getContext('2d');
-    if (!ctx) throw new Error('Canvas 2D 上下文不可用');
-    ctx.fillStyle = '#ffffff'; // 透明底兜底（导出 JPEG 时避免黑底）
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-    ctx.drawImage(img.source, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height);
-
-    return {
-      dataUrl: exportDataUrl(canvas),
-      width: canvas.width,
-      height: canvas.height,
-      ratio: canvas.width / canvas.height,
-    };
+    return renderStage(img, img.width / img.height);
   } finally {
     img.release();
   }
+}
+
+/** 舞台渲染：整图等比缩放到舞台尺寸（最长边 = STAGE_MAX，不裁剪） */
+function renderStage(img: Decoded, ratio: number): StageImage {
+  const { w, h } = computeStageSize(ratio);
+
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.round(w);
+  canvas.height = Math.round(h);
+  const ctx = canvas.getContext('2d');
+  if (!ctx) throw new Error('Canvas 2D 上下文不可用');
+  ctx.fillStyle = '#ffffff'; // 透明底兜底（导出 JPEG 时避免黑底）
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.drawImage(img.source, 0, 0, img.width, img.height, 0, 0, canvas.width, canvas.height);
+
+  return {
+    dataUrl: exportDataUrl(canvas),
+    width: canvas.width,
+    height: canvas.height,
+    ratio: canvas.width / canvas.height,
+  };
 }
 
 /** 内置示例图 / 任意同源 URL → 舞台图 */
