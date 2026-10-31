@@ -9,6 +9,7 @@ import { clearProgress, saveProgress } from '../../storage/progress';
 import { submitResult } from '../../storage/records';
 import { loadSettings, saveSettings } from '../../storage/settings';
 import { must } from '../../utils/dom';
+import { bestRecord, solvedSub, t } from '../i18n';
 import type { GameSession } from '../session';
 
 /** 交换动画时长（与 CSS transition 保持一致） */
@@ -120,8 +121,122 @@ export class GameView {
     });
     this.btnHelp.addEventListener('click', () => this.useHint());
 
+    window.addEventListener('keydown', this.onKeyDown);
     window.addEventListener('resize', this.onResize);
     document.addEventListener('visibilitychange', this.onVisibility);
+  }
+
+  // ---------- 键盘无障碍（F-402，交换式玩法） ----------
+
+  /** 光标所在格（null = 未激活） */
+  private cursorCell: number | null = null;
+  /** 键盘拾起的块 */
+  private heldId: number | null = null;
+
+  private readonly onKeyDown = (e: KeyboardEvent): void => {
+    if (!this.engine || this.engine.isSolved || this.animating) return;
+    if (this.session?.opts.mode !== 'swap') return; // 自由摆放以指针交互为主
+    const target = e.target as HTMLElement | null;
+    if (target && ['INPUT', 'SELECT', 'TEXTAREA'].includes(target.tagName)) return;
+
+    const move = (dc: number, dr: number): void => {
+      e.preventDefault();
+      const base = this.cursorCell ?? this.firstMovableCell();
+      if (base === null) return;
+      const col = Math.min(this.cols - 1, Math.max(0, (base % this.cols) + dc));
+      const row = Math.min(this.rows - 1, Math.max(0, Math.floor(base / this.cols) + dr));
+      this.setCursor(row * this.cols + col);
+    };
+
+    switch (e.key) {
+      case 'ArrowLeft':
+        move(-1, 0);
+        break;
+      case 'ArrowRight':
+        move(1, 0);
+        break;
+      case 'ArrowUp':
+        move(0, -1);
+        break;
+      case 'ArrowDown':
+        move(0, 1);
+        break;
+      case 'Enter':
+      case ' ':
+        e.preventDefault();
+        this.keyboardAction();
+        break;
+      case 'r':
+      case 'R':
+        if (this.session?.opts.rotationEnabled) {
+          const id = this.heldId ?? this.movableAt(this.cursorCell);
+          if (id !== null) this.rotate(id);
+        }
+        break;
+      case 'h':
+      case 'H':
+        this.useHint();
+        break;
+      case 'Escape':
+        this.releaseHeld();
+        break;
+    }
+  };
+
+  private firstMovableCell(): number | null {
+    const p = this.engine?.getPieces().find((it) => !it.locked);
+    return p ? p.cell : null;
+  }
+
+  private movableAt(cell: number | null): number | null {
+    if (cell === null || !this.engine) return null;
+    const p = this.engine.getPieces().find((it) => it.cell === cell);
+    return p && !p.locked ? p.id : null;
+  }
+
+  private setCursor(cell: number): void {
+    this.cursorCell = cell;
+    this.renderCursor();
+    playTone('pick', this.settings.soundOn);
+  }
+
+  private renderCursor(): void {
+    this.board.querySelectorAll('.piece').forEach((el) => el.classList.remove('cursor', 'held'));
+    if (this.cursorCell !== null) {
+      const id = this.engine?.getPieces().find((it) => it.cell === this.cursorCell)?.id;
+      const el = id !== undefined ? this.pieceEl(id) : null;
+      el?.classList.add('cursor');
+      if (this.heldId !== null) this.pieceEl(this.heldId)?.classList.add('held');
+    }
+  }
+
+  private keyboardAction(): void {
+    if (this.cursorCell === null) {
+      this.setCursor(this.firstMovableCell() ?? 0);
+      return;
+    }
+    if (this.heldId === null) {
+      const id = this.movableAt(this.cursorCell);
+      if (id !== null) {
+        this.heldId = id;
+        this.renderCursor();
+        playTone('pick', this.settings.soundOn);
+      }
+      return;
+    }
+    // 交换：复用放置结算（无指针偏移）
+    if (this.heldId !== null) {
+      this.drop(this.heldId, this.cursorCell, 0, 0, 0, 0);
+      this.heldId = null;
+      this.renderCursor();
+    }
+  }
+
+  private releaseHeld(): void {
+    if (this.heldId !== null) {
+      this.heldId = null;
+      this.renderCursor();
+    }
   }
 
   get mounted(): boolean {
@@ -156,6 +271,9 @@ export class GameView {
     else this.stats.start();
 
     this.board.style.backgroundSize = `${100 / this.cols}% ${100 / this.rows}%`;
+    this.board.setAttribute('aria-label', t('boardAria'));
+    this.cursorCell = null;
+    this.heldId = null;
     this.hintEl.style.backgroundImage = `url("${session.stage.dataUrl}")`;
     this.hintEl.style.opacity = String(this.settings.hintOpacity);
     this.applyHint();
@@ -291,8 +409,9 @@ export class GameView {
       }
     }
     this.progressEl.textContent = `${engine.placedCount}/${this.rows * this.cols}`;
-    this.statMoves.textContent = `${engine.moves} 步`;
+    this.statMoves.textContent = `${engine.moves}${t('movesUnit')}`;
     this.btnHelp.textContent = `💡${this.hintsLeft}`;
+    this.btnHelp.title = t('titleHelp');
     this.btnHelp.classList.toggle('off', this.hintsLeft <= 0);
     this.btnHelp.disabled = this.hintsLeft <= 0;
   }
@@ -612,11 +731,11 @@ export class GameView {
     this.statTime.textContent = formatMs(timeMs);
 
     const res = submitResult(this.rows, this.cols, timeMs, engine.moves);
-    this.resultSub.textContent = `用时 ${formatMs(timeMs)} · ${engine.moves} 步`;
+    this.resultSub.textContent = solvedSub(formatMs(timeMs), engine.moves);
     this.resultRecords.textContent =
       res.newTimeRecord || res.newMovesRecord
-        ? '🏆 新纪录！'
-        : `历史最佳 ${formatMs(res.bestTimeMs)} · ${res.bestMoves} 步`;
+        ? t('newRecord')
+        : bestRecord(formatMs(res.bestTimeMs), res.bestMoves);
 
     this.later(() => {
       startConfetti();
@@ -655,15 +774,15 @@ export class GameView {
     ctx.fillStyle = '#eef0f8';
     ctx.textAlign = 'center';
     ctx.font = '600 44px -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif';
-    ctx.fillText('🎉 拼图完成！', W / 2, H - 168);
+    ctx.fillText(t('shareTitle'), W / 2, H - 168);
     ctx.font = '30px -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif';
     ctx.fillText(`${this.rows}×${this.cols} · ${this.rows * this.cols} 块`, W / 2, H - 116);
     ctx.font = '600 36px -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif';
     ctx.fillStyle = '#ffb454';
-    ctx.fillText(`用时 ${this.statTime.textContent} · ${engine.moves} 步`, W / 2, H - 66);
+    ctx.fillText(solvedSub(this.statTime.textContent, engine.moves), W / 2, H - 66);
     ctx.font = '18px -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif';
     ctx.fillStyle = 'rgba(238, 240, 248, 0.7)';
-    ctx.fillText('TinyPuzzle · 在线拼图', W / 2, H - 26);
+    ctx.fillText(t('shareBrand'), W / 2, H - 26);
 
     const a = document.createElement('a');
     a.href = canvas.toDataURL('image/png');
@@ -699,13 +818,13 @@ export class GameView {
 
   private syncToggleButtons(): void {
     this.btnSound.textContent = this.settings.soundOn ? '🔊' : '🔇';
-    this.btnSound.title = this.settings.soundOn ? '音效：开' : '音效：关';
+    this.btnSound.title = this.settings.soundOn ? t('titleSoundOn') : t('titleSoundOff');
     this.btnSound.classList.toggle('off', !this.settings.soundOn);
     this.btnHint.textContent = '👁';
-    this.btnHint.title = this.settings.hintEnabled ? '原图参考：开' : '原图参考：关';
+    this.btnHint.title = this.settings.hintEnabled ? t('titleHintRefOn') : t('titleHintRefOff');
     this.btnHint.classList.toggle('off', !this.settings.hintEnabled);
     this.btnLock.textContent = this.settings.lockOnSnap ? '🔒' : '🔓';
-    this.btnLock.title = this.settings.lockOnSnap ? '吸附锁定：开' : '吸附锁定：关';
+    this.btnLock.title = this.settings.lockOnSnap ? t('titleLockOn') : t('titleLockOff');
     this.btnLock.classList.toggle('off', !this.settings.lockOnSnap);
   }
 

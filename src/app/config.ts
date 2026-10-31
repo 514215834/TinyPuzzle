@@ -1,17 +1,17 @@
-/** 难度配置（F-101 / F-102） */
+/** 难度配置（F-101 / F-102）；labelKey 为 i18n 词条（F-403） */
 export interface PresetDifficulty {
   rows: number;
   cols: number;
-  label: string;
+  labelKey: string;
 }
 
 export const PRESETS: PresetDifficulty[] = [
-  { rows: 3, cols: 3, label: '入门' },
-  { rows: 4, cols: 4, label: '简单' },
-  { rows: 5, cols: 5, label: '中等' },
-  { rows: 6, cols: 6, label: '困难' },
-  { rows: 8, cols: 8, label: '大师' },
-  { rows: 10, cols: 10, label: '地狱' },
+  { rows: 3, cols: 3, labelKey: 'beginner' },
+  { rows: 4, cols: 4, labelKey: 'easy' },
+  { rows: 5, cols: 5, labelKey: 'medium' },
+  { rows: 6, cols: 6, labelKey: 'hard' },
+  { rows: 8, cols: 8, labelKey: 'master' },
+  { rows: 10, cols: 10, labelKey: 'hell' },
 ];
 
 export const MIN_DIM = 2;

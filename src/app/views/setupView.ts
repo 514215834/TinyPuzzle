@@ -1,6 +1,7 @@
 import type { StageImage } from '../../engine/imageProcessor';
 import { loadSettings } from '../../storage/settings';
 import { MAX_DIM, MIN_DIM, PRESETS } from '../config';
+import { presetLabel, t } from '../i18n';
 import { must } from '../../utils/dom';
 
 export interface SetupConfig {
@@ -17,7 +18,11 @@ export interface SetupHandlers {
 }
 
 /** 难度设置页（F-101/F-102/F-301/F-302/F-303）：难度 + 形状 + 玩法 + 旋转 */
-export function initSetupView(handlers: SetupHandlers): { show: (stage: StageImage) => void; hide: () => void } {
+export function initSetupView(handlers: SetupHandlers): {
+  show: (stage: StageImage) => void;
+  hide: () => void;
+  refreshI18n: () => void;
+} {
   const root = must(document.querySelector<HTMLElement>('#view-setup'), '#view-setup');
   const thumb = must(root.querySelector<HTMLImageElement>('#setup-thumb'), '#setup-thumb');
   const grid = must(root.querySelector<HTMLElement>('#setup-grid'), '#setup-grid');
@@ -37,11 +42,13 @@ export function initSetupView(handlers: SetupHandlers): { show: (stage: StageIma
   let mode = settings.mode;
   let rotationEnabled = settings.rotationEnabled;
 
+  const presetLabelHtml = (preset: (typeof PRESETS)[number]): string =>
+    `<b>${preset.rows}×${preset.cols}</b><span>${preset.rows * preset.cols} ${t('pieces')} · ${presetLabel(preset.labelKey)}</span>`;
   for (const preset of PRESETS) {
     const btn = document.createElement('button');
     btn.type = 'button';
     btn.className = 'preset';
-    btn.innerHTML = `<b>${preset.rows}×${preset.cols}</b><span>${preset.rows * preset.cols} 块 · ${preset.label}</span>`;
+    btn.innerHTML = presetLabelHtml(preset);
     btn.addEventListener('click', () => {
       rows = preset.rows;
       cols = preset.cols;
@@ -107,7 +114,7 @@ export function initSetupView(handlers: SetupHandlers): { show: (stage: StageIma
     rotWrap.classList.toggle('hidden', !rotAllowed);
     if (!rotAllowed) rotationEnabled = false;
     rotToggle.classList.toggle('active', rotationEnabled);
-    rotToggle.textContent = rotationEnabled ? '🔄 旋转模式：开' : '🔄 旋转模式：关';
+    rotToggle.textContent = rotationEnabled ? t('rotationOn') : t('rotationOff');
     grid.style.backgroundSize = `${100 / cols}% ${100 / rows}%`;
   }
 
@@ -121,5 +128,12 @@ export function initSetupView(handlers: SetupHandlers): { show: (stage: StageIma
     root.classList.add('hidden');
   }
 
-  return { show, hide };
+  function refreshI18n(): void {
+    presetBtns.forEach((btn, i) => {
+      btn.innerHTML = presetLabelHtml(PRESETS[i]);
+    });
+    sync();
+  }
+
+  return { show, hide, refreshI18n };
 }

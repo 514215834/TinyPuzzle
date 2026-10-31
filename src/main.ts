@@ -2,6 +2,7 @@ import './app/styles/main.css';
 import { registerSW } from 'virtual:pwa-register';
 
 import { unlockAudio } from './app/audio';
+import { applyStatic, getLang, setLang } from './app/i18n';
 import type { StageImage } from './engine/imageProcessor';
 import { loadSettings, saveSettings } from './storage/settings';
 import { GameView } from './app/views/gameView';
@@ -11,9 +12,17 @@ import type { GameSession, ImageMeta } from './app/session';
 import type { SavedProgress } from './storage/progress';
 
 registerSW({ immediate: true });
+applyStatic();
 
 // 首次用户手势时解锁音频（浏览器自动播放策略）
 document.addEventListener('pointerdown', () => unlockAudio(), { once: true, capture: true });
+
+// 语言切换（F-403）
+document.getElementById('btn-lang')?.addEventListener('click', () => {
+  setLang(getLang() === 'zh' ? 'en' : 'zh');
+  home.refreshI18n();
+  setup.refreshI18n();
+});
 
 const homeEl = document.querySelector<HTMLElement>('#view-home')!;
 const setupEl = document.querySelector<HTMLElement>('#view-setup')!;

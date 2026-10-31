@@ -6,6 +6,7 @@ import { deleteImage, getImage, putImage } from '../../storage/imageStore';
 import { must } from '../../utils/dom';
 import { SAMPLES as SAMPLE_LIST } from '../samples';
 import type { ImageMeta } from '../session';
+import { sampleAria, sampleName, t } from '../i18n';
 import { showToast } from '../components/toast';
 
 export interface HomeHandlers {
@@ -21,7 +22,7 @@ interface PendingResume {
 }
 
 /** 首页（F-001 / F-002 / F-205）：上传图片、选择示例图、继续上局 */
-export function initHomeView(handlers: HomeHandlers): { show: () => void; hide: () => void } {
+export function initHomeView(handlers: HomeHandlers): { show: () => void; hide: () => void; refreshI18n: () => void } {
   const root = must(document.querySelector<HTMLElement>('#view-home'), '#view-home');
   const input = must(document.querySelector<HTMLInputElement>('#file-input'), '#file-input');
   const label = must(document.querySelector<HTMLLabelElement>('#upload-label'), '#upload-label');
@@ -38,16 +39,20 @@ export function initHomeView(handlers: HomeHandlers): { show: () => void; hide: 
   let resumeUrl: string | null = null; // objectURL，替换时回收
 
   // ---------- 示例图 ----------
-  for (const sample of SAMPLE_LIST) {
-    const btn = document.createElement('button');
-    btn.type = 'button';
-    btn.className = 'sample';
-    btn.style.backgroundImage = `url("${sample.url}")`;
-    btn.title = sample.name;
-    btn.setAttribute('aria-label', `示例图：${sample.name}`);
-    btn.addEventListener('click', () => void run(() => urlToStage(sample.url), { imageRef: sample.url, imageKind: 'sample' }));
-    grid.appendChild(btn);
+  function buildSamples(): void {
+    grid.innerHTML = '';
+    for (const sample of SAMPLE_LIST) {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'sample';
+      btn.style.backgroundImage = `url("${sample.url}")`;
+      btn.title = sampleName(sample.id);
+      btn.setAttribute('aria-label', sampleAria(sampleName(sample.id)));
+      btn.addEventListener('click', () => void run(() => urlToStage(sample.url), { imageRef: sample.url, imageKind: 'sample' }));
+      grid.appendChild(btn);
+    }
   }
+  buildSamples();
 
   // ---------- 上传 ----------
   input.addEventListener('change', () => {
@@ -70,7 +75,7 @@ export function initHomeView(handlers: HomeHandlers): { show: () => void; hide: 
 
   function handleFile(file: File): void {
     if (!isSupportedImage(file)) {
-      showToast('暂不支持该文件，请选择 PNG / JPG / WebP 图片');
+      showToast(t('unsupportedFile'));
       return;
     }
     void run(() => blobToStage(file), null, file);
@@ -80,7 +85,7 @@ export function initHomeView(handlers: HomeHandlers): { show: () => void; hide: 
     if (busy) return;
     busy = true;
     label.classList.add('loading');
-    label.textContent = '处理中…';
+    label.textContent = t('processing');
     try {
       const stage = await loader();
       if (meta) {
@@ -97,11 +102,11 @@ export function initHomeView(handlers: HomeHandlers): { show: () => void; hide: 
         handlers.onNewStage(stage, resolved);
       }
     } catch {
-      showToast('图片处理失败，请换一张试试');
+      showToast(t('imageFailed'));
     } finally {
       busy = false;
       label.classList.remove('loading');
-      label.textContent = '选择图片';
+      label.textContent = t('chooseImage');
     }
   }
 
@@ -115,7 +120,7 @@ export function initHomeView(handlers: HomeHandlers): { show: () => void; hide: 
         const stage = await pending.load();
         handlers.onResume(stage, { imageRef: pending.saved.imageRef, imageKind: pending.saved.imageKind }, pending.saved);
       } catch {
-        showToast('上局图片已失效，请重新选择');
+        showToast(t('resumeGone'));
         discard();
       } finally {
         busy = false;
@@ -162,7 +167,7 @@ export function initHomeView(handlers: HomeHandlers): { show: () => void; hide: 
         load = () => blobToStage(blob);
       }
       resumeThumb.src = thumbUrl;
-      resumeMeta.textContent = `${saved.rows}×${saved.cols} · ${saved.moves} 步 · ${formatMs(saved.elapsedMs)}`;
+      resumeMeta.textContent = `${saved.rows}×${saved.cols} · ${saved.moves} ${t('movesUnit')} · ${formatMs(saved.elapsedMs)}`;
       pending = { saved, load };
       resumeCard.classList.remove('hidden');
     } catch {
@@ -180,5 +185,12 @@ export function initHomeView(handlers: HomeHandlers): { show: () => void; hide: 
     root.classList.add('hidden');
   }
 
-  return { show, hide };
+  function refreshI18n(): void {
+    buildSamples();
+    if (pending) {
+      resumeMeta.textContent = `${pending.saved.rows}×${pending.saved.cols} · ${pending.saved.moves} ${t('movesUnit')} · ${formatMs(pending.saved.elapsedMs)}`;
+    }
+  }
+
+  return { show, hide, refreshI18n };
 }

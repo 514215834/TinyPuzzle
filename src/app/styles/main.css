@@ -556,6 +556,18 @@ button {
   filter: drop-shadow(0 14px 22px rgba(0, 0, 0, 0.55));
 }
 
+/* 键盘无障碍（F-402）：光标与拾起态 */
+.piece.cursor {
+  outline: 2px dashed var(--accent);
+  outline-offset: 1px;
+}
+
+.piece.held {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+  filter: brightness(1.12);
+}
+
 /* 提示脉冲（F-304） */
 .piece.hinted {
   animation: hintPulse 0.5s ease-in-out 4;
