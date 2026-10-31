@@ -59,6 +59,22 @@
           <label>列 <select id="sel-cols"></select></label>
           <span id="piece-count" class="piece-count"></span>
         </div>
+        <div class="option-rows">
+          <div class="option-row">
+            <span class="option-label">形状</span>
+            <button type="button" class="opt-btn active" data-shape="square">方块</button>
+            <button type="button" class="opt-btn" data-shape="classic">经典凹凸</button>
+          </div>
+          <div class="option-row">
+            <span class="option-label">玩法</span>
+            <button type="button" class="opt-btn active" data-mode="swap">交换拼合</button>
+            <button type="button" class="opt-btn" data-mode="free">自由摆放</button>
+          </div>
+          <div class="option-row" id="opt-rotation-wrap">
+            <span class="option-label">进阶</span>
+            <button type="button" class="opt-btn" id="opt-rotation">🔄 旋转模式：关</button>
+          </div>
+        </div>
         <button id="btn-start" class="btn btn-primary btn-lg" type="button">开始拼图</button>
       </div>
     </section>
@@ -75,6 +91,7 @@
           <b id="progress">0/9</b>
         </div>
         <div class="game-actions">
+          <button id="btn-help" class="icon-btn" type="button" title="提示">💡3</button>
           <button id="btn-hint" class="icon-btn" type="button" title="原图参考">👁</button>
           <button id="btn-lock" class="icon-btn" type="button" title="吸附锁定">🔒</button>
           <button id="btn-sound" class="icon-btn" type="button" title="音效">🔊</button>
@@ -98,6 +115,7 @@
         <p id="result-records" class="result-records"></p>
         <div class="dialog-actions">
           <button id="btn-again" class="btn btn-primary" type="button">再玩一次</button>
+          <button id="btn-share" class="btn btn-ghost" type="button">保存成绩图</button>
           <button id="btn-change" class="btn btn-ghost" type="button">换一张图</button>
         </div>
       </div>

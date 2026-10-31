@@ -5,7 +5,12 @@ import type { PuzzlePiece } from '../src/engine/types';
 
 /** assignment[cell] = pieceId → 拼图块状态 */
 function mk(assignment: number[], lockOnSnap = true): PuzzlePiece[] {
-  return assignment.map((id, cell) => ({ id, cell, locked: lockOnSnap && id === cell }));
+  return assignment.map((id, cell) => ({
+    id,
+    cell,
+    locked: lockOnSnap && id === cell,
+    rot: 0,
+  }));
 }
 
 describe('resolveDrop', () => {

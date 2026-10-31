@@ -1,4 +1,5 @@
 import type { StageImage } from '../engine/imageProcessor';
+import type { GameOptions } from '../engine/types';
 import type { SavedProgress } from '../storage/progress';
 
 /** 图片引用（上传图走 IndexedDB，示例图走静态 URL） */
@@ -13,6 +14,7 @@ export interface GameSession {
   meta: ImageMeta;
   rows: number;
   cols: number;
+  opts: GameOptions;
   /** 继续上局时的快照（F-205） */
   saved?: SavedProgress;
 }

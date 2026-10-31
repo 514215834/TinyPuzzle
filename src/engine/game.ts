@@ -1,7 +1,18 @@
 import { buildPieces } from './slicer';
 import { resolveDrop } from './snapSolver';
 import { shuffledAssignment } from './shuffle';
-import type { DropOutcome, PuzzlePiece } from './types';
+import type { DropOutcome, PlaceOutcome, PuzzlePiece } from './types';
+
+export interface EngineOptions {
+  /** 正确落位后是否锁定（F-106，默认开） */
+  lockOnSnap?: boolean;
+  /** 旋转模式（F-303，默认关） */
+  rotationEnabled?: boolean;
+  /** 交换式 / 自由摆放（F-302，默认交换式） */
+  mode?: 'swap' | 'free';
+  /** 初始朝向（按 pieceId 索引，仅旋转模式生效；用于进度恢复） */
+  rots?: number[];
+}
 
 /**
  * 一局对局的状态容器：持有拼图块状态，对外提供放置结算与重开。
@@ -11,21 +22,33 @@ export class PuzzleEngine {
   private pieces: PuzzlePiece[];
   private movesCount = 0;
 
-  /** 是否在正确落位后锁定（F-106，可随时切换，仅影响后续落子） */
+  /** 是否在正确落位后锁定（可随时切换，仅影响后续落子） */
   lockOnSnap: boolean;
+  readonly rotationEnabled: boolean;
+  readonly mode: 'swap' | 'free';
 
   constructor(
     readonly rows: number,
     readonly cols: number,
     assignment: number[],
-    lockOnSnap = true,
+    opts: EngineOptions = {},
   ) {
-    this.pieces = buildPieces(assignment, lockOnSnap);
+    const lockOnSnap = opts.lockOnSnap ?? true;
+    this.rotationEnabled = opts.rotationEnabled ?? false;
+    this.mode = opts.mode ?? 'swap';
     this.lockOnSnap = lockOnSnap;
+    this.pieces = buildPieces(assignment, lockOnSnap, opts.rots, this.rotationEnabled, this.mode === 'free');
   }
 
-  static create(rows: number, cols: number, lockOnSnap = true, rng: () => number = Math.random): PuzzleEngine {
-    return new PuzzleEngine(rows, cols, shuffledAssignment(rows * cols, rng), lockOnSnap);
+  static create(rows: number, cols: number, opts: EngineOptions = {}, rng: () => number = Math.random): PuzzleEngine {
+    // 自由摆放开局全部散置（cell = -1），不使用打乱布局
+    const assignment = opts.mode === 'free'
+      ? new Array<number>(rows * cols).fill(-1)
+      : shuffledAssignment(rows * cols, rng);
+    return new PuzzleEngine(rows, cols, assignment, {
+      ...opts,
+      rots: opts.rotationEnabled ? randomRots(rows * cols, rng) : opts.rots,
+    });
   }
 
   getPieces(): readonly PuzzlePiece[] {
@@ -44,13 +67,18 @@ export class PuzzleEngine {
     return p;
   }
 
-  /** 已归位块数（按格子判断，与锁定开关无关） */
+  /** 朝向与位置都正确才算归位 */
+  private settled(p: PuzzlePiece): boolean {
+    return p.cell === p.id && (!this.rotationEnabled || p.rot === 0);
+  }
+
+  /** 已归位块数 */
   get placedCount(): number {
-    return this.pieces.reduce((n, p) => n + (p.cell === p.id ? 1 : 0), 0);
+    return this.pieces.reduce((n, p) => n + (this.settled(p) ? 1 : 0), 0);
   }
 
   get isSolved(): boolean {
-    return this.pieces.every((p) => p.cell === p.id);
+    return this.pieces.every((p) => this.settled(p));
   }
 
   /** 有效交换步数（F-104，弹回不计） */
@@ -62,24 +90,57 @@ export class PuzzleEngine {
     this.movesCount = Math.max(0, Math.round(count));
   }
 
-  /** cells[cell] = pieceId（进度快照用） */
+  /** 自由摆放模式：成功归位计一步 */
+  countMove(): void {
+    this.movesCount += 1;
+  }
+
+  /** cells[cell] = pieceId；自由摆放模式未归位的块记为 -1（进度快照用） */
   getAssignment(): number[] {
-    const cells = new Array<number>(this.rows * this.cols).fill(0);
-    for (const p of this.pieces) cells[p.cell] = p.id;
+    const cells = new Array<number>(this.rows * this.cols).fill(-1);
+    for (const p of this.pieces) {
+      if (p.cell >= 0) cells[p.cell] = p.id;
+    }
     return cells;
   }
 
-  /** 放置结算：更新内部状态并返回结果 */
+  /** 朝向表（按 pieceId 索引，进度快照用） */
+  getRots(): number[] {
+    return this.pieces.map((p) => p.rot);
+  }
+
+  /** 交换式放置结算：更新内部状态并返回结果 */
   drop(pieceId: number, targetCell: number): DropOutcome {
-    const { outcome, next } = resolveDrop(this.pieces, pieceId, targetCell, this.lockOnSnap);
+    const { outcome, next } = resolveDrop(this.pieces, pieceId, targetCell, this.lockOnSnap, this.rotationEnabled);
     this.pieces = next;
     if (outcome.type === 'swap' || outcome.type === 'solved') this.movesCount += 1;
     return outcome;
   }
 
+  /** 自由摆放：吸附到正确格（F-302）。朝向不对时仅记录位置、不锁定 */
+  lockPiece(pieceId: number): PlaceOutcome {
+    const p = this.piece(pieceId);
+    p.cell = p.id;
+    p.locked = this.lockOnSnap && (!this.rotationEnabled || p.rot === 0);
+    return this.isSolved ? { type: 'solved' } : { type: 'placed' };
+  }
+
+  /** 旋转一块（F-303）；停放在正确格的块会因朝向变化解除锁定 */
+  rotatePiece(pieceId: number): number {
+    const p = this.piece(pieceId);
+    p.rot = (p.rot + 1) % 4;
+    p.locked = this.lockOnSnap && p.cell === p.id && (!this.rotationEnabled || p.rot === 0);
+    return p.rot;
+  }
+
   /** 同图重新打乱（F-107），步数与进度一并重置 */
   reshuffle(rng: () => number = Math.random): void {
-    this.pieces = buildPieces(shuffledAssignment(this.rows * this.cols, rng), this.lockOnSnap);
+    const rots = this.rotationEnabled ? randomRots(this.rows * this.cols, rng) : undefined;
+    this.pieces = buildPieces(shuffledAssignment(this.rows * this.cols, rng), this.lockOnSnap, rots, this.rotationEnabled, this.mode === 'free');
     this.movesCount = 0;
   }
+}
+
+function randomRots(n: number, rng: () => number): number[] {
+  return Array.from({ length: n }, () => Math.floor(rng() * 4));
 }

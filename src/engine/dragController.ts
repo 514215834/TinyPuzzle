@@ -5,12 +5,27 @@ export interface DragCallbacks {
   /** 是否可拾起该块（未锁定且对局未结束） */
   canPick: (pieceId: number) => boolean;
   /**
-   * 释放结算。targetCell 为有效目标格；块被拖出棋盘时为其原格。
+   * 视图层命中测试（含异形块路径命中与层级优先级，F-301），
+   * 返回命中的拼图块元素，未命中返回 null。
+   */
+  pickAt: (clientX: number, clientY: number) => HTMLElement | null;
+  /**
+   * 释放结算。targetCell 为命中格（自由摆放模式下为块中心所在格）；
+   * cx / cy 为块中心的棋盘坐标（自由摆放吸附判定用）。
    * 引擎状态在回调内更新，动画由视图层依据返回值播放。
    */
-  drop: (pieceId: number, targetCell: number, dx: number, dy: number) => DropOutcome;
-  /** 拖拽命中的目标格变化（null 表示无有效目标），用于高亮 */
-  targetCellChange: (cell: number | null) => void;
+  drop: (
+    pieceId: number,
+    targetCell: number,
+    dx: number,
+    dy: number,
+    cx: number,
+    cy: number,
+  ) => DropOutcome;
+  /** 拖拽悬停信息变化（块 id + 目标格 + 块中心），null 表示无有效目标 */
+  hoverChange: (info: { pieceId: number; cell: number | null; cx: number; cy: number } | null) => void;
+  /** 旋转请求（F-303，双击 / 长按触发）；未启用旋转时不传 */
+  rotate?: (pieceId: number) => void;
 }
 
 interface DragSession {
@@ -22,7 +37,12 @@ interface DragSession {
   /** 拾起时所在格 */
   startCell: number;
   target: number | null;
+  moved: boolean;
 }
+
+const LONG_PRESS_MS = 480;
+const LONG_PRESS_TOLERANCE = 8;
+const PICK_GRACE = 8;
 
 /**
  * 拖拽控制（F-004）：Pointer Events 统一鼠标 / 触屏，
@@ -30,6 +50,7 @@ interface DragSession {
  */
 export class DragController {
   private session: DragSession | null = null;
+  private pressTimer: number | undefined;
 
   constructor(
     private board: HTMLElement,
@@ -40,6 +61,7 @@ export class DragController {
     board.addEventListener('pointermove', this.onMove);
     board.addEventListener('pointerup', this.onUp);
     board.addEventListener('pointercancel', this.onCancel);
+    board.addEventListener('dblclick', this.onDblClick);
     board.addEventListener('contextmenu', this.onContextMenu);
   }
 
@@ -49,7 +71,9 @@ export class DragController {
     board.removeEventListener('pointermove', this.onMove);
     board.removeEventListener('pointerup', this.onUp);
     board.removeEventListener('pointercancel', this.onCancel);
+    board.removeEventListener('dblclick', this.onDblClick);
     board.removeEventListener('contextmenu', this.onContextMenu);
+    window.clearTimeout(this.pressTimer);
   }
 
   private onContextMenu = (e: Event): void => {
@@ -58,7 +82,20 @@ export class DragController {
 
   private onDown = (e: PointerEvent): void => {
     if (this.session || !e.isPrimary) return;
-    const el = this.pickElement(e);
+    let el = this.cb.pickAt(e.clientX, e.clientY);
+    if (!el) {
+      // 8px 容差（F-201）：小尺寸块在移动端更易触达
+      const rect = this.board.getBoundingClientRect();
+      if (
+        e.clientX < rect.left - PICK_GRACE || e.clientX > rect.right + PICK_GRACE ||
+        e.clientY < rect.top - PICK_GRACE || e.clientY > rect.bottom + PICK_GRACE
+      ) {
+        return;
+      }
+      const px = Math.min(Math.max(e.clientX, rect.left), rect.right - 1);
+      const py = Math.min(Math.max(e.clientY, rect.top), rect.bottom - 1);
+      el = this.cb.pickAt(px, py);
+    }
     if (!el) return;
     const pieceId = Number(el.dataset.pieceId);
     if (!this.cb.canPick(pieceId)) return;
@@ -77,28 +114,33 @@ export class DragController {
       el,
       startCell: Number(el.dataset.cell),
       target: null,
+      moved: false,
     };
     el.classList.add('dragging');
     el.style.zIndex = '30';
+    if (this.cb.rotate) {
+      window.clearTimeout(this.pressTimer);
+      this.pressTimer = window.setTimeout(() => {
+        if (this.session && !this.session.moved) this.cb.rotate?.(this.session.pieceId);
+      }, LONG_PRESS_MS);
+    }
   };
 
-  /** 命中拼图块；未直接命中时提供 8px 容差（F-201，小尺寸块更易触达） */
-  private pickElement(e: PointerEvent): HTMLElement | null {
-    const direct = (e.target as HTMLElement | null)?.closest<HTMLElement>('[data-piece-id]');
-    if (direct) return direct;
-
+  /** 块中心棋盘坐标：格上块按格中心，自由散布块按像素位置 */
+  private centerOf(s: DragSession, dx: number, dy: number): { cx: number; cy: number } {
     const rect = this.board.getBoundingClientRect();
-    const pad = 8;
-    if (
-      e.clientX < rect.left - pad || e.clientX > rect.right + pad ||
-      e.clientY < rect.top - pad || e.clientY > rect.bottom + pad
-    ) {
-      return null;
+    const cw = rect.width / this.spec.cols;
+    const ch = rect.height / this.spec.rows;
+    if (s.startCell >= 0) {
+      return {
+        cx: ((s.startCell % this.spec.cols) + 0.5) * cw + dx,
+        cy: (Math.floor(s.startCell / this.spec.cols) + 0.5) * ch + dy,
+      };
     }
-    const px = Math.min(Math.max(e.clientX, rect.left), rect.right - 1);
-    const py = Math.min(Math.max(e.clientY, rect.top), rect.bottom - 1);
-    const cell = cellAtPoint(px - rect.left, py - rect.top, rect.width, rect.height, this.spec.rows, this.spec.cols);
-    return this.board.querySelector<HTMLElement>(`[data-cell="${cell}"]`);
+    return {
+      cx: Number(s.el.dataset.px ?? 0) + cw / 2 + dx,
+      cy: Number(s.el.dataset.py ?? 0) + ch / 2 + dy,
+    };
   }
 
   private onMove = (e: PointerEvent): void => {
@@ -108,14 +150,15 @@ export class DragController {
 
     const dx = e.clientX - s.startX;
     const dy = e.clientY - s.startY;
-    s.el.style.transform = `translate3d(${dx}px, ${dy}px, 0) scale(1.04)`;
+    if (!s.moved && Math.hypot(dx, dy) > LONG_PRESS_TOLERANCE) {
+      s.moved = true;
+      window.clearTimeout(this.pressTimer);
+    }
+    s.el.style.transform = `translate3d(${dx}px, ${dy}px, 0) scale(1.04)${this.currentRot(s.el)}`;
 
-    // 以块中心判定目标格；中心拖出棋盘视为无效落点
+    // 以块中心判定目标格；中心拖出棋盘视为无目标
     const rect = this.board.getBoundingClientRect();
-    const cw = rect.width / this.spec.cols;
-    const ch = rect.height / this.spec.rows;
-    const cx = ((s.startCell % this.spec.cols) + 0.5) * cw + dx;
-    const cy = (Math.floor(s.startCell / this.spec.cols) + 0.5) * ch + dy;
+    const { cx, cy } = this.centerOf(s, dx, dy);
     const inside = cx >= 0 && cx <= rect.width && cy >= 0 && cy <= rect.height;
     const hit = inside
       ? cellAtPoint(cx, cy, rect.width, rect.height, this.spec.rows, this.spec.cols)
@@ -124,21 +167,36 @@ export class DragController {
 
     if (target !== s.target) {
       s.target = target;
-      this.cb.targetCellChange(target);
+      this.cb.hoverChange({ pieceId: s.pieceId, cell: target, cx, cy });
     }
+  };
+
+  private currentRot(el: HTMLElement): string {
+    const rot = Number(el.dataset.rot ?? 0);
+    return rot ? ` rotate(${rot * 90}deg)` : '';
+  }
+
+  private onDblClick = (e: MouseEvent): void => {
+    if (!this.cb.rotate || this.session) return;
+    const el = this.cb.pickAt(e.clientX, e.clientY);
+    if (!el) return;
+    const pieceId = Number(el.dataset.pieceId);
+    if (this.cb.canPick(pieceId)) this.cb.rotate(pieceId);
   };
 
   private finish(e: PointerEvent, cancelled: boolean): void {
     const s = this.session;
     if (!s || e.pointerId !== s.pointerId) return;
+    window.clearTimeout(this.pressTimer);
     this.session = null;
     s.el.classList.remove('dragging');
-    this.cb.targetCellChange(null);
+    this.cb.hoverChange(null);
 
     const dx = e.clientX - s.startX;
     const dy = e.clientY - s.startY;
+    const { cx, cy } = this.centerOf(s, dx, dy);
     const target = cancelled ? s.startCell : (s.target ?? s.startCell);
-    this.cb.drop(s.pieceId, target, dx, dy);
+    this.cb.drop(s.pieceId, target, dx, dy, cx, cy);
   }
 
   private onUp = (e: PointerEvent): void => {

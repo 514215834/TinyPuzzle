@@ -49,9 +49,33 @@ describe('buildPieces', () => {
   it('按 assignment 建块并初始化锁定状态', () => {
     const pieces = buildPieces([1, 0, 2]);
     expect(pieces).toEqual([
-      { id: 1, cell: 0, locked: false },
-      { id: 0, cell: 1, locked: false },
-      { id: 2, cell: 2, locked: true },
+      { id: 1, cell: 0, locked: false, rot: 0 },
+      { id: 0, cell: 1, locked: false, rot: 0 },
+      { id: 2, cell: 2, locked: true, rot: 0 },
     ]);
+  });
+
+  it('旋转模式：按 rots 初始化朝向，朝向不对则不锁定', () => {
+    const pieces = buildPieces([0, 1, 2], true, [0, 1, 0], true);
+    expect(pieces[0]).toMatchObject({ id: 0, cell: 0, locked: true, rot: 0 });
+    expect(pieces[1]).toMatchObject({ id: 1, cell: 1, locked: false, rot: 1 });
+  });
+
+  it('自由摆放模式：全部不在格上（F-302）', () => {
+    const pieces = buildPieces([-1, -1, -1], true, undefined, false, true);
+    expect(pieces.every((p) => p.cell === -1 && !p.locked)).toBe(true);
+  });
+
+  it('自由摆放恢复：正条目归位、-1 散置', () => {
+    // cells: 格 0 放块 2（非正确格，不锁定），格 2 放块 0（正确格，锁定），块 1 未归位
+    const pieces = buildPieces([2, -1, 0], true, undefined, false, true);
+    expect(pieces).toEqual([
+      { id: 0, cell: 2, locked: false, rot: 0 },
+      { id: 1, cell: -1, locked: false, rot: 0 },
+      { id: 2, cell: 0, locked: false, rot: 0 },
+    ]);
+    // 只有落在正确格的块才锁定
+    const settled = buildPieces([0, -1, 2], true, undefined, false, true);
+    expect(settled.map((p) => p.locked)).toEqual([true, false, true]);
   });
 });

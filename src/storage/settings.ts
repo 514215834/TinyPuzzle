@@ -14,6 +14,12 @@ export interface Settings {
   hintOpacity: number;
   /** 音效开关（F-203） */
   soundOn: boolean;
+  /** 拼图形状（F-301） */
+  shape: 'square' | 'classic';
+  /** 玩法模式（F-302） */
+  mode: 'swap' | 'free';
+  /** 旋转模式（F-303） */
+  rotationEnabled: boolean;
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -23,6 +29,9 @@ export const DEFAULT_SETTINGS: Settings = {
   hintEnabled: false,
   hintOpacity: 0.2,
   soundOn: true,
+  shape: 'square',
+  mode: 'swap',
+  rotationEnabled: false,
 };
 
 const KEY = 'tp.settings';
@@ -37,6 +46,10 @@ function clampBool(v: unknown, fallback: boolean): boolean {
   return typeof v === 'boolean' ? v : fallback;
 }
 
+function clampEnum<T extends string>(v: unknown, allowed: T[], fallback: T): T {
+  return allowed.includes(v as T) ? (v as T) : fallback;
+}
+
 export function loadSettings(): Settings {
   const raw = readJson<Partial<Settings>>(KEY) ?? {};
   return {
@@ -46,6 +59,9 @@ export function loadSettings(): Settings {
     hintEnabled: clampBool(raw.hintEnabled, DEFAULT_SETTINGS.hintEnabled),
     hintOpacity: Math.min(0.6, Math.max(0.05, Number(raw.hintOpacity) || DEFAULT_SETTINGS.hintOpacity)),
     soundOn: clampBool(raw.soundOn, DEFAULT_SETTINGS.soundOn),
+    shape: clampEnum(raw.shape, ['square', 'classic'], DEFAULT_SETTINGS.shape),
+    mode: clampEnum(raw.mode, ['swap', 'free'], DEFAULT_SETTINGS.mode),
+    rotationEnabled: clampBool(raw.rotationEnabled, DEFAULT_SETTINGS.rotationEnabled),
   };
 }
 

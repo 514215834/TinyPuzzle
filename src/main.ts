@@ -24,22 +24,42 @@ const gameView = new GameView(gameEl);
 
 const home = initHomeView({
   onNewStage: (stage: StageImage, meta: ImageMeta) => {
-    const settings = loadSettings();
-    session = { stage, meta, rows: settings.rows, cols: settings.cols };
+    const s = loadSettings();
+    session = {
+      stage,
+      meta,
+      rows: s.rows,
+      cols: s.cols,
+      opts: { mode: s.mode, shape: s.shape, rotationEnabled: s.rotationEnabled },
+    };
     location.hash = '#/setup';
   },
   onResume: (stage: StageImage, meta: ImageMeta, saved: SavedProgress) => {
-    session = { stage, meta, rows: saved.rows, cols: saved.cols, saved };
+    session = {
+      stage,
+      meta,
+      rows: saved.rows,
+      cols: saved.cols,
+      opts: { mode: saved.mode, shape: saved.shape, rotationEnabled: saved.rotationEnabled },
+      saved,
+    };
     location.hash = '#/play';
   },
 });
 
 const setup = initSetupView({
-  onStart: (rows: number, cols: number) => {
+  onStart: (config) => {
     if (!session) return;
-    session.rows = rows;
-    session.cols = cols;
-    saveSettings({ rows, cols }); // 记忆难度（F-101）
+    session.rows = config.rows;
+    session.cols = config.cols;
+    session.opts = { mode: config.mode, shape: config.shape, rotationEnabled: config.rotationEnabled };
+    saveSettings({
+      rows: config.rows,
+      cols: config.cols,
+      shape: config.shape,
+      mode: config.mode,
+      rotationEnabled: config.rotationEnabled,
+    }); // 记忆难度与玩法（F-101/F-301/F-302/F-303）
     location.hash = '#/play';
   },
   onBack: () => {
@@ -57,7 +77,7 @@ function route(): void {
     homeEl.classList.add('hidden');
     setupEl.classList.add('hidden');
     gameEl.classList.remove('hidden'); // 先显示再挂载，fitBoard 才能测到真实尺寸
-    gameView.mount(session!);
+    void gameView.mount(session!);
     return;
   }
 
