@@ -4,8 +4,8 @@
  */
 
 export interface StageImage {
-  /** 处理后的位图 dataURL（拼图块背景图来源） */
-  dataUrl: string;
+  /** 处理后的位图 URL（Blob URL，拼图块背景图来源；Blob 驻留免 base64 +33% 开销，F-513） */
+  url: string;
   width: number;
   height: number;
   /** 宽高比 width / height（与原图一致） */
@@ -69,23 +69,29 @@ async function decode(blob: Blob): Promise<Decoded> {
   return decodeViaImage(blob);
 }
 
-function exportDataUrl(canvas: HTMLCanvasElement): string {
-  const webp = canvas.toDataURL('image/webp', 0.9);
-  return webp.startsWith('data:image/webp') ? webp : canvas.toDataURL('image/jpeg', 0.9);
+/** 舞台图导出：优先 WebP Blob URL（体积小、免 base64 驻留），toBlob 不可用时回落 JPEG dataURL */
+function exportStageUrl(canvas: HTMLCanvasElement): Promise<string> {
+  return new Promise((resolve) => {
+    canvas.toBlob(
+      (blob) => resolve(blob ? URL.createObjectURL(blob) : canvas.toDataURL('image/jpeg', 0.9)),
+      'image/webp',
+      0.9,
+    );
+  });
 }
 
 /** Blob / File → 舞台图（保留原图完整内容与真实比例） */
 export async function blobToStage(blob: Blob): Promise<StageImage> {
   const img = await decode(blob);
   try {
-    return renderStage(img, img.width / img.height);
+    return await renderStage(img, img.width / img.height);
   } finally {
     img.release();
   }
 }
 
 /** 舞台渲染：整图等比缩放到舞台尺寸（最长边 = STAGE_MAX，不裁剪） */
-function renderStage(img: Decoded, ratio: number): StageImage {
+async function renderStage(img: Decoded, ratio: number): Promise<StageImage> {
   const { w, h } = computeStageSize(ratio);
 
   const canvas = document.createElement('canvas');
@@ -98,7 +104,7 @@ function renderStage(img: Decoded, ratio: number): StageImage {
   ctx.drawImage(img.source, 0, 0, img.width, img.height, 0, 0, canvas.width, canvas.height);
 
   return {
-    dataUrl: exportDataUrl(canvas),
+    url: await exportStageUrl(canvas),
     width: canvas.width,
     height: canvas.height,
     ratio: canvas.width / canvas.height,

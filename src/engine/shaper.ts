@@ -102,14 +102,11 @@ export function buildShapeSpec(
   return { rows, cols, stageW, stageH, margin, hEdges, vEdges };
 }
 
-/**
- * 构建单块的局部路径（画布像素坐标，含 margin 留白）。
- * 描边顺序（屏幕坐标系顺时针）：上（正向）→ 右（正向）→ 下（反向）→ 左（反向）。
- */
-export function buildPiecePath(spec: ShapeSpec, pieceId: number): Path2D {
-  const { rows, cols, stageW, stageH, hEdges, vEdges, margin } = spec;
-  const cw = stageW / cols;
-  const ch = stageH / rows;
+/** 生成整块路径的 SVG d 串（画布局部坐标 = stage 坐标平移 margin-原点；sx/sy 用于归一化裁形） */
+export function buildPiecePathData(spec: ShapeSpec, pieceId: number, sx = 1, sy = 1): string {
+  const { rows, cols, hEdges, vEdges, margin } = spec;
+  const cw = spec.stageW / cols;
+  const ch = spec.stageH / rows;
   const S = Math.min(cw, ch);
   const r = Math.floor(pieceId / cols);
   const c = pieceId % cols;
@@ -118,8 +115,10 @@ export function buildPiecePath(spec: ShapeSpec, pieceId: number): Path2D {
   const y0 = r * ch;
   const ox = margin - x0; // 舞台坐标 → 画布局部坐标
   const oy = margin - y0;
+  const fx = (v: number): string => (v * sx).toFixed(4);
+  const fy = (v: number): string => (v * sy).toFixed(4);
 
-  const path = new Path2D();
+  let d = `M${fx(x0 + ox)} ${fy(y0 + oy)}`;
   const addSegs = (
     from: { x: number; y: number },
     to: { x: number; y: number },
@@ -134,37 +133,83 @@ export function buildPiecePath(spec: ShapeSpec, pieceId: number): Path2D {
     const nx = -ey;
     const ny = ex;
     if (!params) {
-      path.lineTo(to.x + ox, to.y + oy);
+      d += `L${fx(to.x + ox)} ${fy(to.y + oy)}`;
       return;
     }
     const segs = reversed ? reverseSegs(tabSegments(params)) : tabSegments(params);
     for (const [, C1, C2, P3] of segs) {
       const a = mapPt(from, ex, ey, L, nx, ny, S, C1);
       const b = mapPt(from, ex, ey, L, nx, ny, S, C2);
-      const d = mapPt(from, ex, ey, L, nx, ny, S, P3);
-      path.bezierCurveTo(a.x + ox, a.y + oy, b.x + ox, b.y + oy, d.x + ox, d.y + oy);
+      const p3 = mapPt(from, ex, ey, L, nx, ny, S, P3);
+      d += `C${fx(a.x + ox)} ${fy(a.y + oy)} ${fx(b.x + ox)} ${fy(b.y + oy)} ${fx(p3.x + ox)} ${fy(p3.y + oy)}`;
     }
   };
 
-  path.moveTo(x0 + ox, y0 + oy);
   addSegs({ x: x0, y: y0 }, { x: x0 + cw, y: y0 }, hEdges[r][c], false); // 上
   addSegs({ x: x0 + cw, y: y0 }, { x: x0 + cw, y: y0 + ch }, vEdges[r][c + 1], false); // 右
   addSegs({ x: x0 + cw, y: y0 + ch }, { x: x0, y: y0 + ch }, hEdges[r + 1][c], true); // 下
   addSegs({ x: x0, y: y0 + ch }, { x: x0, y: y0 }, vEdges[r][c], true); // 左
-  path.closePath();
-  return path;
+  return `${d}Z`;
+}
+
+export function buildPiecePath(spec: ShapeSpec, pieceId: number): Path2D {
+  return new Path2D(buildPiecePathData(spec, pieceId));
 }
 
 export interface BuiltPieceShape {
-  canvas: HTMLCanvasElement;
+  /** 命中测试路径（画布局部坐标，逻辑尺寸见 logicalW/H） */
   path: Path2D;
-  /** 画布实际像素 / 逻辑像素 比（高清采样倍率，命中测试换算用） */
-  scale: number;
+  /** objectBoundingBox 归一化裁形引用 id（视图注入共享 <clipPath> 节点） */
+  clipId: string;
+  /** 归一化裁形路径（0-1 坐标 d 串），随元素尺寸自适应缩放 */
+  clipD: string;
+  /** 画布局部逻辑尺寸（stage px）：命中测试坐标换算用 */
+  logicalW: number;
+  logicalH: number;
 }
 
-export interface BuildShapeOptions {
-  /** 液态玻璃质感（F-510）：磨砂折射 + 高光扫掠 + 菲涅尔亮边，默认开 */
-  glass?: boolean;
+/**
+ * 整副棋盘的形状几何（F-513 图集化）：纯计算瞬时完成，不再逐块生成位图。
+ * 块面像素由视图以共享舞台图为 background 图层提供，轮廓由 objectBoundingBox clip-path 裁出。
+ */
+export function buildPieceShapes(spec: ShapeSpec): BuiltPieceShape[] {
+  const cw = spec.stageW / spec.cols;
+  const ch = spec.stageH / spec.rows;
+  const W = cw + spec.margin * 2;
+  const H = ch + spec.margin * 2;
+  const out: BuiltPieceShape[] = [];
+  for (let id = 0; id < spec.rows * spec.cols; id++) {
+    out.push({
+      path: new Path2D(buildPiecePathData(spec, id)),
+      clipId: `piece-clip-${id}`,
+      clipD: buildPiecePathData(spec, id, 1 / W, 1 / H),
+      logicalW: W,
+      logicalH: H,
+    });
+  }
+  return out;
+}
+
+/**
+ * 舞台模糊折射图层（F-510 / F-513）：全场一次生成，Blob URL 供全部块以 background 图层共享。
+ * screen 混合无逐层透明度可调，故按折射强度把 alpha 预先烘进图内（等价原 canvas globalAlpha）。
+ */
+export async function buildBlurredStageUrl(stageUrl: string, refraction = 0.22): Promise<string> {
+  const img = new Image();
+  img.src = stageUrl;
+  await img.decode();
+  const blur = buildBlurredStage(img);
+  const bctx = blur.getContext('2d');
+  if (bctx && refraction < 1) {
+    bctx.globalCompositeOperation = 'destination-in';
+    bctx.fillStyle = `rgba(0, 0, 0, ${Math.max(0, Math.min(1, refraction)).toFixed(3)})`;
+    bctx.fillRect(0, 0, blur.width, blur.height);
+  }
+  return new Promise<string>((resolve) => {
+    blur.toBlob((blob) => {
+      resolve(blob ? URL.createObjectURL(blob) : blur.toDataURL('image/webp', 0.8));
+    }, 'image/webp', 0.8);
+  });
 }
 
 /**
@@ -200,102 +245,3 @@ function buildBlurredStage(img: HTMLImageElement): HTMLCanvasElement {
   return big;
 }
 
-/**
- * 在（已裁剪、已绘底图的）画布上叠加玻璃层（F-510）。
- * 坐标约定：局部画布 (0,0)-(cw+2m, ch+2m) 对应舞台源图 (cellOx, cellOy) 起。
- */
-function paintGlass(
-  ctx: CanvasRenderingContext2D,
-  path: Path2D,
-  blur: HTMLCanvasElement,
-  cellOx: number,
-  cellOy: number,
-  W: number,
-  H: number,
-  cell: number,
-): void {
-  const a = Math.min(1, cell / 90); // 小格子降低玻璃强度，保证图像可辨识
-  const W2 = W / 2;
-  const H2 = H / 2;
-
-  // 1) 折射层：模糊底图放大 1.06 + 轻微偏移，screen 混合出「光透过玻璃」的磨砂感
-  ctx.save();
-  ctx.globalCompositeOperation = 'screen';
-  ctx.globalAlpha = 0.16 + 0.1 * a;
-  ctx.translate((1 - 1.06) * W2 + 0.02 * cell, (1 - 1.06) * H2 - 0.03 * cell);
-  ctx.scale(1.06, 1.06);
-  ctx.drawImage(blur, 0, 0, blur.width, blur.height, -cellOx, -cellOy, blur.width, blur.height);
-  ctx.restore();
-
-  // 2) 高光扫掠：对角渐变（左上亮 → 中段透明 → 右下微亮）
-  const sheen = ctx.createLinearGradient(0, 0, W, H);
-  sheen.addColorStop(0, `rgba(255, 255, 255, ${0.22 * a + 0.04})`);
-  sheen.addColorStop(0.32, `rgba(255, 255, 255, ${0.05 * a})`);
-  sheen.addColorStop(0.68, 'rgba(255, 255, 255, 0)');
-  sheen.addColorStop(1, `rgba(255, 255, 255, ${0.09 * a + 0.02})`);
-  ctx.fillStyle = sheen;
-  ctx.fill(path);
-
-  // 3) 内侧柔光（宽描边在 clip 内只留内半，形成玻璃厚度辉光）
-  ctx.strokeStyle = `rgba(255, 255, 255, ${0.08 * a + 0.03})`;
-  ctx.lineWidth = Math.max(3, cell * 0.06);
-  ctx.stroke(path);
-}
-
-/** 载入舞台图并为每块生成离屏切片 + 命中路径（按块数 2~3 倍超采样，缩放查看不模糊） */
-export async function buildPieceShapes(
-  spec: ShapeSpec,
-  stageDataUrl: string,
-  opts: BuildShapeOptions = {},
-): Promise<BuiltPieceShape[]> {
-  const img = new Image();
-  img.src = stageDataUrl;
-  await img.decode();
-  const glass = opts.glass !== false;
-  const blur = glass ? buildBlurredStage(img) : null;
-
-  const { rows, cols, stageW, stageH, margin } = spec;
-  const cw = stageW / cols;
-  const ch = stageH / rows;
-  // 超采样倍率：≤1200 块用 3×，更多用 2×（平衡清晰度与显存）
-  const dpr = rows * cols > 1200 ? 2 : 3;
-  const out: BuiltPieceShape[] = [];
-  for (let id = 0; id < rows * cols; id++) {
-    const path = buildPiecePath(spec, id);
-    const canvas = document.createElement('canvas');
-    canvas.width = Math.round((cw + margin * 2) * dpr);
-    canvas.height = Math.round((ch + margin * 2) * dpr);
-    const ctx = canvas.getContext('2d');
-    if (!ctx) throw new Error('Canvas 2D 上下文不可用');
-    ctx.scale(dpr, dpr); // 路径与绘制保持逻辑坐标，背板高清
-    const r = Math.floor(id / cols);
-    const c = id % cols;
-    // 路径已是画布局部坐标：直接裁剪；源矩形显式取「格子外扩 margin 与舞台的交集」
-    const sx = Math.max(0, c * cw - margin);
-    const sy = Math.max(0, r * ch - margin);
-    const sw = Math.min(stageW, (c + 1) * cw + margin) - sx;
-    const sh = Math.min(stageH, (r + 1) * ch + margin) - sy;
-    const dx = sx - (c * cw - margin);
-    const dy = sy - (r * ch - margin);
-    const W = cw + margin * 2;
-    const H = ch + margin * 2;
-    ctx.save();
-    ctx.clip(path);
-    ctx.drawImage(img, sx, sy, sw, sh, dx, dy, sw, sh);
-    if (blur) paintGlass(ctx, path, blur, c * cw - margin, r * ch - margin, W, H, Math.min(cw, ch));
-    ctx.restore();
-    // 深色定形描边 + 菲涅尔亮边（对角渐变：左上强、右下弱）
-    ctx.strokeStyle = 'rgba(0, 0, 0, 0.28)';
-    ctx.lineWidth = 2;
-    ctx.stroke(path);
-    const rim = ctx.createLinearGradient(0, 0, W, H);
-    rim.addColorStop(0, 'rgba(255, 255, 255, 0.5)');
-    rim.addColorStop(0.45, 'rgba(255, 255, 255, 0.16)');
-    rim.addColorStop(1, 'rgba(255, 255, 255, 0.1)');
-    ctx.strokeStyle = rim;
-    ctx.lineWidth = 1.5;
-    ctx.stroke(path);
-    out.push({ canvas, path, scale: dpr });
-  }
-  return out;
-}

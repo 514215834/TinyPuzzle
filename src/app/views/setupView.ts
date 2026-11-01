@@ -70,7 +70,7 @@ export function initSetupView(handlers: SetupHandlers): {
   }
 
   function show(stage: StageImage): void {
-    thumb.src = stage.dataUrl;
+    thumb.src = stage.url;
     stageRatio = stage.ratio;
     root.classList.remove('hidden');
     presetBtns.forEach((btn, i) => {

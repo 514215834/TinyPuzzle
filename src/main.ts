@@ -34,8 +34,14 @@ const gameEl = document.querySelector<HTMLElement>('#view-game')!;
 let session: GameSession | null = null;
 const gameView = new GameView(gameEl);
 
+/** 换局时回收上一局的舞台图 Blob URL（F-513） */
+function releaseStageUrl(): void {
+  if (session?.stage.url.startsWith('blob:')) URL.revokeObjectURL(session.stage.url);
+}
+
 const home = initHomeView({
   onNewStage: (stage: StageImage, meta: ImageMeta) => {
+    releaseStageUrl();
     const s = loadSettings();
     const { rows, cols } = fitGrid(stage.ratio, s.pieceTarget);
     session = {
@@ -49,6 +55,7 @@ const home = initHomeView({
     location.hash = '#/setup';
   },
   onResume: (stage: StageImage, meta: ImageMeta, saved: SavedProgress) => {
+    releaseStageUrl();
     session = {
       stage,
       meta,

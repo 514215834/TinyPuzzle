@@ -4,7 +4,7 @@ import { DragController } from '../../engine/dragController';
 import { PuzzleEngine } from '../../engine/game';
 import type { PhysRect } from '../../engine/physics';
 import { PhysWorld } from '../../engine/physics';
-import { buildPieceShapes, buildShapeSpec } from '../../engine/shaper';
+import { buildBlurredStageUrl, buildPieceShapes, buildShapeSpec } from '../../engine/shaper';
 import { StatsService, formatMs } from '../../engine/stats';
 import type { DropOutcome, PuzzlePiece } from '../../engine/types';
 import { clearProgress, saveProgress } from '../../storage/progress';
@@ -78,7 +78,11 @@ export class GameView {
 
   // V0.4：形状 / 自由摆放 / 旋转 / 提示
   private spec: ReturnType<typeof buildShapeSpec> | null = null;
-  private shapes: Awaited<ReturnType<typeof buildPieceShapes>> | null = null;
+  private shapes: ReturnType<typeof buildPieceShapes> | null = null;
+  /** 拼图块元素缓存（id 即下标，构建时填充，F-513）：避免 syncPieces 逐块 querySelector 的 O(n²) 扫描 */
+  private pieceEls: HTMLElement[] = [];
+  /** 全场共享的模糊折射图层（Blob URL，F-513 图集化） */
+  private blurUrl: string | null = null;
   private hitCtx: CanvasRenderingContext2D | null = null;
   private freePos = new Map<number, { x: number; y: number }>();
   private hintsLeft = MAX_HINTS;
@@ -91,9 +95,15 @@ export class GameView {
   /** 拖拽中的块（kinematic body），无则 null */
   private physHeldId: number | null = null;
   private physHeldMovedAt = 0;
+  /**
+   * 物理运动锚点（F-513）：运动期只写 transform（合成器路径，不触发布局），
+   * left/top 保持锚点不动；静置 / 被拾起时一次性落回 left/top。
+   */
+  private physAnchors = new Map<number, { x: number; y: number }>();
 
   private readonly onResize = (): void => {
     this.fitBoard();
+    this.controller?.invalidateLayout(); // 棋盘布局尺寸变化，拖拽量测缓存失效（F-513）
     this.clampAllFreePos();
     this.clampPan();
     this.applyViewport();
@@ -166,6 +176,7 @@ export class GameView {
       this.settings = saveSettings({ physicsOn: !this.settings.physicsOn });
       if (this.settings.physicsOn) this.initPhysics();
       else {
+        this.commitPhysAnchors(); // 关闭物理前先把锚点位移落回 left/top（F-513）
         this.stopPhysLoop();
         this.phys?.clear();
         this.phys = null;
@@ -262,6 +273,7 @@ export class GameView {
   }
 
   private applyViewport(): void {
+    this.controller?.invalidateLayout(); // 平移 / 缩放改变棋盘 client 原点，拖拽量测缓存失效（F-513）
     this.board.style.transformOrigin = '0 0';
     this.board.style.transform = `translate(${this.panX}px, ${this.panY}px) scale(${this.zoom})`;
   }
@@ -314,14 +326,21 @@ export class GameView {
   private readonly onWheel = (e: WheelEvent): void => {
     if (!this.engine) return;
     e.preventDefault();
+    this.wrap.classList.add('gesturing'); // 手势期降级 backdrop-filter，避免逐帧重光栅化（F-513）
+    window.clearTimeout(this.wheelGestureTimer);
+    this.wheelGestureTimer = window.setTimeout(() => this.wrap.classList.remove('gesturing'), 180);
     this.zoomAt(e.clientX, e.clientY, Math.exp(-e.deltaY * 0.0015));
   };
+  private wheelGestureTimer: number | undefined;
 
   private readonly onViewportPointerDown = (e: PointerEvent): void => {
     if (!this.engine) return;
     if ((e.target as HTMLElement | null)?.closest('.piece')) return; // 拼图块交给 DragController
     this.viewportPointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
-    if (this.viewportPointers.size === 1) e.preventDefault();
+    if (this.viewportPointers.size === 1) {
+      e.preventDefault();
+      this.wrap.classList.add('gesturing'); // 平移 / 双指缩放期间关闭玻璃模糊（F-513）
+    }
   };
 
   private readonly onViewportPointerMove = (e: PointerEvent): void => {
@@ -360,6 +379,7 @@ export class GameView {
 
   private readonly onViewportPointerUp = (e: PointerEvent): void => {
     this.viewportPointers.delete(e.pointerId);
+    if (this.viewportPointers.size === 0) this.wrap.classList.remove('gesturing');
   };
 
   // ---------- 键盘无障碍（F-402，交换式玩法）+ 旋转快捷键 ----------
@@ -539,7 +559,7 @@ export class GameView {
     this.cursorCell = null;
     this.heldId = null;
     this.resetViewport();
-    this.hintEl.style.backgroundImage = `url("${session.stage.dataUrl}")`;
+    this.hintEl.style.backgroundImage = `url("${session.stage.url}")`;
     this.hintEl.style.opacity = String(this.settings.hintOpacity);
     this.applyHint();
     this.syncToggleButtons();
@@ -561,6 +581,7 @@ export class GameView {
 
     const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
     const intro = !saved && !reducedMotion; // 新局才播爆散开场；续局与减动效走错落入场
+    this.animating = true; // 构建含分片让出（F-513），期间拦截拖拽 / 键盘 / 重开，直到入场动画接管
     await this.buildPieces(intro);
     if (!this.session || !this.engine) return; // 构建期间被卸载，不再继续挂载
     this.controller = new DragController(this.board, { rows: this.rows, cols: this.cols }, {
@@ -594,6 +615,12 @@ export class GameView {
     this.session = null;
     this.spec = null;
     this.shapes = null;
+    this.pieceEls = [];
+    if (this.blurUrl) {
+      URL.revokeObjectURL(this.blurUrl);
+      this.blurUrl = null;
+    }
+    document.getElementById('piece-clips')?.remove();
     this.freePos.clear();
     this.animating = false;
     this.introPlaying = false;
@@ -601,6 +628,7 @@ export class GameView {
     this.phys?.clear();
     this.phys = null;
     this.physHeldId = null;
+    this.physAnchors.clear();
     const cellCodes = document.getElementById('cell-codes');
     if (cellCodes) cellCodes.classList.add('hidden');
     this.resetViewport();
@@ -622,19 +650,25 @@ export class GameView {
 
     if (this.session?.opts.shape === 'classic') {
       this.spec = buildShapeSpec(this.rows, this.cols, stage.width, stage.height);
-      this.shapes = await buildPieceShapes(this.spec, stage.dataUrl);
-      if (!this.session || !this.engine) return; // 切图期间被卸载（如地狱难度切图较慢时返回）
+      this.shapes = buildPieceShapes(this.spec); // 纯几何瞬时完成（F-513 图集化：不再逐块光栅位图）
+      // 折射强度随格子尺寸衰减（同原 paintGlass：a = cell/90）
+      const refraction = 0.16 + 0.1 * Math.min(1, Math.min(stage.width / this.cols, stage.height / this.rows) / 90);
+      this.blurUrl = await buildBlurredStageUrl(stage.url, refraction); // 全场共享一张模糊折射图层
+      if (!this.session || !this.engine) return; // 切图期间被卸载
+      this.injectPieceClips();
     } else {
       this.spec = null;
       this.shapes = null;
     }
 
+    this.pieceEls = new Array(engine.getPieces().length);
     for (const p of engine.getPieces()) {
       const el = document.createElement('div');
       el.className = 'piece';
       el.dataset.pieceId = String(p.id);
       el.dataset.rot = String(p.rot);
       this.applyPieceGeometry(el, p.id);
+      this.pieceEls[p.id] = el;
       if (intro) {
         // 爆散开场：先整体隐藏，亮相位姿由 playExplosionIntro 接管
         el.style.opacity = '0';
@@ -667,23 +701,69 @@ export class GameView {
   /** 按形状/模式设置块的尺寸与初始位置 */
   private applyPieceGeometry(el: HTMLElement, id: number): void {
     const stage = must(this.session, '对局参数缺失').stage;
-    if (this.shapes && this.spec) {
+    if (this.shapes && this.spec && this.blurUrl) {
       const shape = this.shapes[id];
       const { mx, my } = this.marginPct();
       el.classList.add('shaped');
       el.style.width = `${100 / this.cols + mx * 2}%`;
       el.style.height = `${100 / this.rows + my * 2}%`;
-      el.appendChild(shape.canvas);
-      shape.canvas.className = 'piece-canvas';
+      // 轮廓：共享 objectBoundingBox clip-path（F-513 图集化，随元素尺寸自适应）
+      el.style.clipPath = `url(#${shape.clipId})`;
+      // 块面：共享舞台图 + 模糊折射 + CSS 渐变玻璃（F-510），不再逐块 canvas
+      const cw = stage.width / this.cols;
+      const ch = stage.height / this.rows;
+      const m = this.spec.margin;
+      const a = Math.min(1, Math.min(cw, ch) / 90); // 小格子降低玻璃强度，保证图像可辨识
+      const sizeX = (stage.width / (cw + m * 2)) * 100; // 舞台图铺到元素坐标的比例
+      const sizeY = (stage.height / (ch + m * 2)) * 100;
+      const col = id % this.cols;
+      const row = Math.floor(id / this.cols);
+      // bg-position 百分比：offset / (元素 - 图) ，把舞台图平移到本块格子外扩 margin 的位置
+      const posX = ((m - col * cw) / (cw + m * 2 - stage.width)) * 100;
+      const posY = ((m - row * ch) / (ch + m * 2 - stage.height)) * 100;
+      el.style.backgroundImage = [
+        `linear-gradient(135deg, rgba(255,255,255,${(0.22 * a + 0.04).toFixed(3)}) 0%, rgba(255,255,255,${(0.05 * a).toFixed(3)}) 32%, rgba(255,255,255,0) 68%, rgba(255,255,255,${(0.09 * a + 0.02).toFixed(3)}) 100%)`,
+        `url("${this.blurUrl}")`,
+        `linear-gradient(315deg, rgba(0,0,0,${(0.06 + 0.1 * a).toFixed(3)}) 0%, rgba(0,0,0,0) 42%, rgba(255,255,255,${(0.06 + 0.1 * a).toFixed(3)}) 100%)`,
+        `url("${stage.url}")`,
+      ].join(', ');
+      el.style.backgroundSize = `100% 100%, ${sizeX * 1.06}% ${sizeY * 1.06}%, 100% 100%, ${sizeX}% ${sizeY}%`;
+      el.style.backgroundPosition = '0 0, 50% 50%, 0 0, ' + `${posX}% ${posY}%`;
+      el.style.backgroundBlendMode = 'normal, screen, overlay, normal';
+      el.style.backgroundRepeat = 'no-repeat';
     } else {
       el.style.width = `${100 / this.cols}%`;
       el.style.height = `${100 / this.rows}%`;
-      el.style.backgroundImage = `url("${stage.dataUrl}")`;
+      el.style.backgroundImage = `url("${stage.url}")`;
       el.style.backgroundSize = `${this.cols * 100}% ${this.rows * 100}%`;
       const col = id % this.cols;
       const row = Math.floor(id / this.cols);
       el.style.backgroundPosition = `${(col / (this.cols - 1)) * 100}% ${(row / (this.rows - 1)) * 100}%`;
     }
+  }
+
+  /** 注入全部异形块的共享 <clipPath> 定义（objectBoundingBox 归一化，一份 DOM 服务所有块） */
+  private injectPieceClips(): void {
+    if (!this.shapes) return;
+    document.getElementById('piece-clips')?.remove();
+    const NS = 'http://www.w3.org/2000/svg';
+    const svg = document.createElementNS(NS, 'svg');
+    svg.id = 'piece-clips';
+    svg.setAttribute('width', '0');
+    svg.setAttribute('height', '0');
+    svg.style.position = 'absolute';
+    const frag = document.createDocumentFragment();
+    for (const s of this.shapes) {
+      const clip = document.createElementNS(NS, 'clipPath');
+      clip.setAttribute('id', s.clipId);
+      clip.setAttribute('clipPathUnits', 'objectBoundingBox'); // 0-1 归一化坐标随元素尺寸缩放
+      const path = document.createElementNS(NS, 'path');
+      path.setAttribute('d', s.clipD);
+      clip.appendChild(path);
+      frag.appendChild(clip);
+    }
+    svg.appendChild(frag);
+    document.body.appendChild(svg);
   }
 
   private restTransform(el: HTMLElement): void {
@@ -727,7 +807,7 @@ export class GameView {
   }
 
   private pieceEl(id: number): HTMLElement | null {
-    return this.board.querySelector<HTMLElement>(`[data-piece-id="${id}"]`);
+    return this.pieceEls[id] ?? null; // 数组缓存 O(1)（F-513），原 querySelector 全表扫描为 O(n)
   }
 
   // ---------- 开局爆散开场（F-512） ----------
@@ -936,10 +1016,9 @@ export class GameView {
       const sin = Math.sin(rad);
       [dx, dy] = [dx * cos - dy * sin, dx * sin + dy * cos];
     }
-    // 画布背板为高清采样，路径坐标是逻辑尺寸，需按倍率换算
-    const cscale = shape.scale || 1;
-    const lx = ((dx + hw) / (hw * 2)) * (shape.canvas.width / cscale);
-    const ly = ((dy + hh) / (hh * 2)) * (shape.canvas.height / cscale);
+    // 画布逻辑尺寸为 stage 像素，路径坐标同源，直接映射（考虑旋转后）
+    const lx = ((dx + hw) / (hw * 2)) * shape.logicalW;
+    const ly = ((dy + hh) / (hh * 2)) * shape.logicalH;
     return ctx.isPointInPath(shape.path, lx, ly);
   }
 
@@ -1180,6 +1259,31 @@ export class GameView {
     const off = p.cell < 0 ? { x: mx, y: my } : { x: 0, y: 0 };
     const bx = cx + off.x;
     const by = cy + off.y;
+    const anchor = this.physAnchors.get(pieceId);
+    if (anchor) {
+      // 拾起运动中的块（F-513）：先把物理位置落回 left/top，控制权交给指针
+      const box = this.freePieceBox();
+      const pos = phys.bodyPos(pieceId);
+      const x = (pos ? pos.x : anchor.x + box.w / 2) - box.w / 2;
+      const y = (pos ? pos.y : anchor.y + box.h / 2) - box.h / 2;
+      this.freePos.set(pieceId, { x, y });
+      const el = this.pieceEl(pieceId);
+      if (el) {
+        el.classList.add('no-anim');
+        el.style.transition = '';
+        el.style.left = `${x}px`;
+        el.style.top = `${y}px`;
+        el.dataset.px = String(x);
+        el.dataset.py = String(y);
+        // 与拖拽控制器同构的位移串，接住指针起点避免跳变
+        const dx0 = bx - (anchor.x + box.w / 2);
+        const dy0 = by - (anchor.y + box.h / 2);
+        const rot = Number(el.dataset.rot ?? 0);
+        el.style.transform = `translate3d(${dx0}px, ${dy0}px, 0) scale(1.04)${rot ? ` rotate(${rot * 90}deg)` : ''}`;
+        el.classList.remove('no-anim');
+      }
+      this.physAnchors.delete(pieceId);
+    }
     if (!phys.has(pieceId)) phys.ensureBody(pieceId, bx, by, this.physRadius());
     phys.setKinematic(pieceId, bx, by, vx, vy);
     this.physHeldId = pieceId;
@@ -1205,17 +1309,22 @@ export class GameView {
         if (!pos) continue;
         const x = pos.x - half.w;
         const y = pos.y - half.h;
+        let anchor = this.physAnchors.get(id);
+        if (!anchor) {
+          anchor = { x, y }; // 首次运动：以当前 left/top 为锚，运动期仅写 transform
+          this.physAnchors.set(id, anchor);
+          const el0 = this.pieceEl(id);
+          if (el0) el0.style.transition = 'none';
+        }
         this.freePos.set(id, { x, y });
         const el = this.pieceEl(id);
         if (el) {
-          el.style.left = `${x}px`;
-          el.style.top = `${y}px`;
-          el.dataset.px = String(x);
-          el.dataset.py = String(y);
+          el.style.transform = `translate3d(${x - anchor.x}px, ${y - anchor.y}px, 0)${this.poseSuffix(el)}`;
         }
       }
     }
     if (phys.isSettled && this.physHeldId === null) {
+      this.commitPhysAnchors();
       this.physRunning = false;
       this.physRaf = 0;
       this.scheduleSave(); // 静置后的散布位置入快照
@@ -1223,6 +1332,31 @@ export class GameView {
     }
     this.physRaf = requestAnimationFrame(this.physLoop);
   };
+
+  /** 物理静置：把锚定期的 transform 位移一次性落回 left/top（单帧提交，F-513） */
+  private commitPhysAnchors(): void {
+    if (!this.physAnchors.size) return;
+    const phys = this.phys;
+    const box = this.freePieceBox();
+    for (const [id, anchor] of this.physAnchors) {
+      const pos = phys?.bodyPos(id);
+      const x = (pos ? pos.x : anchor.x + box.w / 2) - box.w / 2;
+      const y = (pos ? pos.y : anchor.y + box.h / 2) - box.h / 2;
+      this.freePos.set(id, { x, y });
+      const el = this.pieceEl(id);
+      if (el) {
+        el.classList.add('no-anim');
+        el.style.transition = '';
+        el.style.left = `${x}px`;
+        el.style.top = `${y}px`;
+        el.dataset.px = String(x);
+        el.dataset.py = String(y);
+        this.restTransform(el);
+        el.classList.remove('no-anim');
+      }
+    }
+    this.physAnchors.clear();
+  }
 
   private startPhysLoop(): void {
     if (this.physRunning || !this.phys) return;
@@ -1442,7 +1576,7 @@ export class GameView {
     if (!ctx) return;
 
     const img = new Image();
-    img.src = session.stage.dataUrl;
+    img.src = session.stage.url;
     await img.decode();
     // cover 铺满
     const scale = Math.max(W / img.width, H / img.height);
@@ -1523,6 +1657,7 @@ export class GameView {
 
   private restart(): void {
     if (!this.engine || this.animating) return; // 动画进行中不重开（避免开场序列重叠）
+    this.commitPhysAnchors(); // 物理运动中重开：先把锚点位移落盘再重散布（F-513）
     this.board.classList.remove('solved');
     this.engine.reshuffle();
     this.hintsLeft = MAX_HINTS;
@@ -1646,6 +1781,7 @@ export class GameView {
     const field = this.fieldRect();
     for (const p of this.engine.getPieces()) {
       if (p.cell >= 0) continue;
+      if (this.physAnchors.has(p.id)) continue; // 运动中的块由物理锚点接管（F-513）
       const pos = this.freePos.get(p.id);
       if (!pos) continue;
       pos.x = Math.min(Math.max(pos.x, field.fx), field.fx + field.fw - box.w);

@@ -63,6 +63,7 @@ const VELOCITY_WINDOW_MS = 110;
 export class DragController {
   private session: DragSession | null = null;
   private pressTimer: number | undefined;
+  private measure: { left: number; top: number; scale: number; w: number; h: number } | null = null;
 
   constructor(
     private board: HTMLElement,
@@ -84,6 +85,26 @@ export class DragController {
     board.removeEventListener('pointercancel', this.onCancel);
     board.removeEventListener('contextmenu', this.onContextMenu);
     window.clearTimeout(this.pressTimer);
+  }
+
+  /** 棋盘尺寸 / 视口缩放变化后调用，使量测缓存失效 */
+  invalidateLayout(): void {
+    this.measure = null;
+  }
+
+  /** 量测（缓存）：棋盘 client 原点 / 视觉缩放系数 / 布局尺寸 */
+  private measureBoard(): { left: number; top: number; scale: number; w: number; h: number } {
+    if (!this.measure) {
+      const rect = this.board.getBoundingClientRect();
+      this.measure = {
+        left: rect.left,
+        top: rect.top,
+        scale: rect.width / (this.board.offsetWidth || 1),
+        w: this.board.offsetWidth,
+        h: this.board.offsetHeight,
+      };
+    }
+    return this.measure;
   }
 
   /** 是否有进行中的拖拽（视图层判断是否让位给平移手势） */
@@ -109,12 +130,6 @@ export class DragController {
     return el.dataset.flipped === '1' ? ' rotateY(180deg)' : '';
   }
 
-  /** 棋盘视觉缩放系数：client px / 棋盘局部 px（视口缩放后两者不再相等） */
-  private scaleFactor(): number {
-    const rect = this.board.getBoundingClientRect();
-    return rect.width / (this.board.offsetWidth || 1);
-  }
-
   private onContextMenu = (e: Event): void => {
     e.preventDefault(); // 屏蔽长按右键菜单，避免干扰触屏拖拽
   };
@@ -124,15 +139,17 @@ export class DragController {
     let el = this.cb.pickAt(e.clientX, e.clientY);
     if (!el) {
       // 8px 容差（F-201）：小尺寸块在移动端更易触达
-      const rect = this.board.getBoundingClientRect();
+      const m = this.measureBoard();
+      const right = m.left + m.scale * m.w;
+      const bottom = m.top + m.scale * m.h;
       if (
-        e.clientX < rect.left - PICK_GRACE || e.clientX > rect.right + PICK_GRACE ||
-        e.clientY < rect.top - PICK_GRACE || e.clientY > rect.bottom + PICK_GRACE
+        e.clientX < m.left - PICK_GRACE || e.clientX > right + PICK_GRACE ||
+        e.clientY < m.top - PICK_GRACE || e.clientY > bottom + PICK_GRACE
       ) {
         return;
       }
-      const px = Math.min(Math.max(e.clientX, rect.left), rect.right - 1);
-      const py = Math.min(Math.max(e.clientY, rect.top), rect.bottom - 1);
+      const px = Math.min(Math.max(e.clientX, m.left), right - 1);
+      const py = Math.min(Math.max(e.clientY, m.top), bottom - 1);
       el = this.cb.pickAt(px, py);
     }
     if (!el) return;
@@ -171,8 +188,9 @@ export class DragController {
 
   /** 块中心棋盘坐标：格上块按格中心，自由散布块按像素位置（均为局部 px） */
   private centerOf(s: DragSession, dx: number, dy: number): { cx: number; cy: number } {
-    const cw = this.board.offsetWidth / this.spec.cols;
-    const ch = this.board.offsetHeight / this.spec.rows;
+    const m = this.measureBoard();
+    const cw = m.w / this.spec.cols;
+    const ch = m.h / this.spec.rows;
     if (s.startCell >= 0) {
       return {
         cx: ((s.startCell % this.spec.cols) + 0.5) * cw + dx,
@@ -191,7 +209,7 @@ export class DragController {
     e.preventDefault();
 
     // 位移统一换算为棋盘局部 px（client px / 缩放系数），视觉位移随缩放保持 1:1
-    const scale = this.scaleFactor();
+    const { scale, w, h } = this.measureBoard();
     const dx = (e.clientX - s.startX) / scale;
     const dy = (e.clientY - s.startY) / scale;
     s.lastDx = dx;
@@ -203,8 +221,6 @@ export class DragController {
     s.el.style.transform = `translate3d(${dx}px, ${dy}px, 0) scale(1.04)${this.currentRot(s.el)}`;
 
     // 以块中心判定目标格；中心拖出棋盘视为无目标
-    const w = this.board.offsetWidth;
-    const h = this.board.offsetHeight;
     const { cx, cy } = this.centerOf(s, dx, dy);
     const inside = cx >= 0 && cx <= w && cy >= 0 && cy <= h;
     const hit = inside
@@ -248,7 +264,7 @@ export class DragController {
     s.el.classList.remove('dragging');
     this.cb.hoverChange(null);
 
-    const scale = this.scaleFactor();
+    const scale = this.measureBoard().scale;
     const dx = (e.clientX - s.startX) / scale;
     const dy = (e.clientY - s.startY) / scale;
     const { cx, cy } = this.centerOf(s, dx, dy);
