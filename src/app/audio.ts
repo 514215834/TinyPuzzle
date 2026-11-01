@@ -34,6 +34,18 @@ function tone(freq: number, startAt: number, dur: number, type: OscillatorType, 
   osc.stop(t0 + dur + 0.02);
 }
 
+/**
+ * 输出链路延迟（秒，F-512）：start() 到实际可闻的滞后（outputLatency + baseLatency）。
+ * 仅在爆散音确实会发声时返回非零值，供视觉爆点对齐可闻时刻；钳制在 0~260ms。
+ */
+export function audioOutputLatency(soundEnabled: boolean): number {
+  if (!soundEnabled || !ctx || ctx.state !== 'running') return 0;
+  const c = ctx as AudioContext & { outputLatency?: number; baseLatency?: number };
+  const lat = (c.outputLatency ?? 0) + (c.baseLatency ?? 0);
+  if (!Number.isFinite(lat)) return 0;
+  return Math.max(0, Math.min(0.26, lat));
+}
+
 /** enabled 由调用方传入（settings.soundOn），未解锁或静音时静默跳过 */
 export function playTone(name: SoundName, enabled: boolean): void {
   if (!enabled || !ctx || ctx.state !== 'running') return;

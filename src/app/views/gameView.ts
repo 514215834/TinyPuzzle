@@ -1,4 +1,4 @@
-import { playTone } from '../audio';
+import { audioOutputLatency, playTone } from '../audio';
 import { startConfetti } from '../components/confetti';
 import { DragController } from '../../engine/dragController';
 import { PuzzleEngine } from '../../engine/game';
@@ -23,7 +23,6 @@ const INTRO_REVEAL_MS = 420; // 完整拼图整体淡入亮相
 const INTRO_HOLD_MS = 520; // 定格蓄力，给玩家看清原图的时间
 const INTRO_FLY_MS = 760; // 碎块爆散飞行
 const INTRO_STAGGER_MS = 110; // 冲击波由内向外传播的起爆延迟上限
-const INTRO_TOTAL_MS = INTRO_REVEAL_MS + INTRO_HOLD_MS + INTRO_STAGGER_MS + INTRO_FLY_MS + 80;
 /** 进度快照节流间隔 */
 const SAVE_THROTTLE_MS = 400;
 /** 吸附阈值系数（架构文档 §7.5） */
@@ -910,46 +909,50 @@ export class GameView {
       );
     }
 
-    // 阶段二：定格蓄力后引爆——白闪 + 冲击波 + 震屏，碎块带随机翻滚向外炸飞
+    // 阶段二：定格蓄力后引爆——白闪 + 冲击波 + 震屏，碎块带随机翻滚向外炸飞。
+    // 声音先起播，其可闻点滞后 = 输出链路延迟；视觉爆点按该延迟后移对齐可闻时刻（F-512）
     this.later(() => {
       if (!this.engine) return; // 已卸载
-      this.spawnExplosionFx();
       playTone('explosion', this.settings.soundOn);
-      for (const f of flights) {
-        const spin = Math.round(Math.random() * 56 - 28); // 起爆瞬间碎块的随机翻滚量
-        f.el.animate(
-          [
-            { transform: f.reveal, offset: 0, easing: 'cubic-bezier(0.5, 0, 0.75, 0.6)' },
-            {
-              transform: f.reveal
-                .replace('rotate(0deg)', `rotate(${spin}deg)`)
-                .replace(' scale(1)', ' scale(1.06)'),
-              offset: 0.14,
-              easing: 'cubic-bezier(0.16, 0.84, 0.26, 1.02)', // 快出缓收 + 轻微过冲回弹
-            },
-            { transform: f.land, offset: 1 },
-          ],
-          { duration: INTRO_FLY_MS, delay: f.delay, fill: 'both' },
-        );
-      }
+      const visualDelay = Math.round(audioOutputLatency(this.settings.soundOn) * 1000);
+      this.later(() => {
+        if (!this.engine) return; // 已卸载
+        this.spawnExplosionFx();
+        for (const f of flights) {
+          const spin = Math.round(Math.random() * 56 - 28); // 起爆瞬间碎块的随机翻滚量
+          f.el.animate(
+            [
+              { transform: f.reveal, offset: 0, easing: 'cubic-bezier(0.5, 0, 0.75, 0.6)' },
+              {
+                transform: f.reveal
+                  .replace('rotate(0deg)', `rotate(${spin}deg)`)
+                  .replace(' scale(1)', ' scale(1.06)'),
+                offset: 0.14,
+                easing: 'cubic-bezier(0.16, 0.84, 0.26, 1.02)', // 快出缓收 + 轻微过冲回弹
+              },
+              { transform: f.land, offset: 1 },
+            ],
+            { duration: INTRO_FLY_MS, delay: f.delay, fill: 'both' },
+          );
+        }
+      }, visualDelay);
+      // 阶段三：收尾——随视觉引爆顺延，确保碎块飞完再恢复常态（引擎同步 + 夹取 + 入快照）
+      this.later(() => {
+        for (const f of flights) {
+          const el = f.el;
+          el.classList.add('no-anim');
+          el.style.opacity = '';
+          el.style.transform = this.poseSuffix(el);
+          el.classList.remove('no-anim');
+          for (const a of el.getAnimations()) a.cancel();
+        }
+        this.introPlaying = false;
+        this.animating = false;
+        this.syncPieces();
+        this.clampAllFreePos();
+        this.saveProgressNow();
+      }, visualDelay + INTRO_STAGGER_MS + INTRO_FLY_MS + 80);
     }, INTRO_REVEAL_MS + INTRO_HOLD_MS);
-
-    // 阶段三：收尾——取消动画恢复常态，引擎同步 + 夹取 + 入快照
-    this.later(() => {
-      for (const f of flights) {
-        const el = f.el;
-        el.classList.add('no-anim');
-        el.style.opacity = '';
-        el.style.transform = this.poseSuffix(el);
-        el.classList.remove('no-anim');
-        for (const a of el.getAnimations()) a.cancel();
-      }
-      this.introPlaying = false;
-      this.animating = false;
-      this.syncPieces();
-      this.clampAllFreePos();
-      this.saveProgressNow();
-    }, INTRO_TOTAL_MS);
   }
 
   /** 爆炸瞬间特效：白闪 + 冲击波光环 + 场地震屏（CSS 动画结束自毁） */
