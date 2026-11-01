@@ -705,17 +705,27 @@ button {
   box-shadow: 0 0 0 2px rgba(93, 211, 158, 0.5);
 }
 
-/* 异形块（F-301 → F-513 图集化）：轮廓由共享 objectBoundingBox clip-path 裁出，
-   块面 = 舞台图 + 模糊折射 + CSS 渐变玻璃（见 applyPieceGeometry），无逐块 canvas */
+/* 异形块（F-301 → F-513 图集化）：正面层 .piece-front 携带背景图层与共享 clip-path 裁形
+   （objectBoundingBox，随元素尺寸自适应），液态玻璃 = 舞台图 + 模糊折射 + CSS 渐变合成。
+   滤镜留在 .piece 父级：渲染管线先滤镜后裁剪，父级滤镜在子级裁剪之外，
+   锁定辉光 / 拿起透光 / 提示脉冲的 drop-shadow 才能溢出轮廓可见 */
 .piece.shaped {
   overflow: visible;
   border-radius: 0;
   box-shadow: none;
 }
 
+.piece.shaped .piece-front {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  backface-visibility: hidden; /* 双击翻面：正面随元素转向背面时隐藏，露出背面卡 */
+  -webkit-backface-visibility: hidden;
+}
+
 .piece.shaped.locked {
   box-shadow: none;
-  /* 已归位定形（原 piece-canvas 滤镜迁移至元素本身） */
+  /* 已归位定形：绿色轮廓辉光（父级滤镜，不受子级裁剪影响） */
   filter: drop-shadow(0 0 3px rgba(93, 211, 158, 0.9));
 }
 
@@ -966,14 +976,9 @@ button {
   text-shadow: 0 1px 2px rgba(0, 0, 0, 0.6);
 }
 
-/* 双击翻面：3D 翻转，背面为拼图卡背面 + 编码 */
+/* 双击翻面：3D 翻转，背面为拼图卡背面 + 编码（正面隐藏规则在 .piece-front） */
 .piece {
   transform-style: preserve-3d;
-}
-
-.piece .piece-canvas {
-  backface-visibility: hidden;
-  -webkit-backface-visibility: hidden;
 }
 
 .piece-back {

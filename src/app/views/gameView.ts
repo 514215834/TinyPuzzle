@@ -707,8 +707,6 @@ export class GameView {
       el.classList.add('shaped');
       el.style.width = `${100 / this.cols + mx * 2}%`;
       el.style.height = `${100 / this.rows + my * 2}%`;
-      // 轮廓：共享 objectBoundingBox clip-path（F-513 图集化，随元素尺寸自适应）
-      el.style.clipPath = `url(#${shape.clipId})`;
       // 块面：共享舞台图 + 模糊折射 + CSS 渐变玻璃（F-510），不再逐块 canvas
       const cw = stage.width / this.cols;
       const ch = stage.height / this.rows;
@@ -721,16 +719,23 @@ export class GameView {
       // bg-position 百分比：offset / (元素 - 图) ，把舞台图平移到本块格子外扩 margin 的位置
       const posX = ((m - col * cw) / (cw + m * 2 - stage.width)) * 100;
       const posY = ((m - row * ch) / (ch + m * 2 - stage.height)) * 100;
-      el.style.backgroundImage = [
+      // 正面下沉为子层（F-513 回归修复）：背景 + 裁形挂 .piece-front 并隐藏背面，
+      // 双击翻面才显示背面卡而非镜像图；滤镜（锁定辉光 / 提示脉冲）留在父级，
+      // 在裁剪之外渲染，drop-shadow 轮廓光才不会被元素自身的 clip-path 裁掉
+      const front = document.createElement('div');
+      front.className = 'piece-front';
+      front.style.clipPath = `url(#${shape.clipId})`;
+      front.style.backgroundImage = [
         `linear-gradient(135deg, rgba(255,255,255,${(0.22 * a + 0.04).toFixed(3)}) 0%, rgba(255,255,255,${(0.05 * a).toFixed(3)}) 32%, rgba(255,255,255,0) 68%, rgba(255,255,255,${(0.09 * a + 0.02).toFixed(3)}) 100%)`,
         `url("${this.blurUrl}")`,
         `linear-gradient(315deg, rgba(0,0,0,${(0.06 + 0.1 * a).toFixed(3)}) 0%, rgba(0,0,0,0) 42%, rgba(255,255,255,${(0.06 + 0.1 * a).toFixed(3)}) 100%)`,
         `url("${stage.url}")`,
       ].join(', ');
-      el.style.backgroundSize = `100% 100%, ${sizeX * 1.06}% ${sizeY * 1.06}%, 100% 100%, ${sizeX}% ${sizeY}%`;
-      el.style.backgroundPosition = '0 0, 50% 50%, 0 0, ' + `${posX}% ${posY}%`;
-      el.style.backgroundBlendMode = 'normal, screen, overlay, normal';
-      el.style.backgroundRepeat = 'no-repeat';
+      front.style.backgroundSize = `100% 100%, ${sizeX * 1.06}% ${sizeY * 1.06}%, 100% 100%, ${sizeX}% ${sizeY}%`;
+      front.style.backgroundPosition = '0 0, 50% 50%, 0 0, ' + `${posX}% ${posY}%`;
+      front.style.backgroundBlendMode = 'normal, screen, overlay, normal';
+      front.style.backgroundRepeat = 'no-repeat';
+      el.appendChild(front);
     } else {
       el.style.width = `${100 / this.cols}%`;
       el.style.height = `${100 / this.rows}%`;
