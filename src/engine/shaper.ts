@@ -162,14 +162,97 @@ export interface BuiltPieceShape {
   scale: number;
 }
 
+export interface BuildShapeOptions {
+  /** 液态玻璃质感（F-510）：磨砂折射 + 高光扫掠 + 菲涅尔亮边，默认开 */
+  glass?: boolean;
+}
+
+/**
+ * 整图模糊底图：逐级 1/2 降采样到约 1/8 再放大回原尺寸。
+ * 不用 ctx.filter（Safari 支持不完整），靠降采样+双线性放大获得天然模糊。
+ */
+function buildBlurredStage(img: HTMLImageElement): HTMLCanvasElement {
+  const W = Math.max(1, img.naturalWidth);
+  const H = Math.max(1, img.naturalHeight);
+  let src: CanvasImageSource = img;
+  let w = W;
+  let h = H;
+  for (let i = 0; i < 3; i++) {
+    w = Math.max(1, Math.round(w / 2));
+    h = Math.max(1, Math.round(h / 2));
+    const step = document.createElement('canvas');
+    step.width = w;
+    step.height = h;
+    const sctx = step.getContext('2d');
+    if (!sctx) break;
+    sctx.imageSmoothingQuality = 'high';
+    sctx.drawImage(src, 0, 0, w, h);
+    src = step;
+  }
+  const big = document.createElement('canvas');
+  big.width = W;
+  big.height = H;
+  const bctx = big.getContext('2d');
+  if (bctx) {
+    bctx.imageSmoothingQuality = 'high';
+    bctx.drawImage(src, 0, 0, W, H);
+  }
+  return big;
+}
+
+/**
+ * 在（已裁剪、已绘底图的）画布上叠加玻璃层（F-510）。
+ * 坐标约定：局部画布 (0,0)-(cw+2m, ch+2m) 对应舞台源图 (cellOx, cellOy) 起。
+ */
+function paintGlass(
+  ctx: CanvasRenderingContext2D,
+  path: Path2D,
+  blur: HTMLCanvasElement,
+  cellOx: number,
+  cellOy: number,
+  W: number,
+  H: number,
+  cell: number,
+): void {
+  const a = Math.min(1, cell / 90); // 小格子降低玻璃强度，保证图像可辨识
+  const W2 = W / 2;
+  const H2 = H / 2;
+
+  // 1) 折射层：模糊底图放大 1.06 + 轻微偏移，screen 混合出「光透过玻璃」的磨砂感
+  ctx.save();
+  ctx.globalCompositeOperation = 'screen';
+  ctx.globalAlpha = 0.16 + 0.1 * a;
+  ctx.translate((1 - 1.06) * W2 + 0.02 * cell, (1 - 1.06) * H2 - 0.03 * cell);
+  ctx.scale(1.06, 1.06);
+  ctx.drawImage(blur, 0, 0, blur.width, blur.height, -cellOx, -cellOy, blur.width, blur.height);
+  ctx.restore();
+
+  // 2) 高光扫掠：对角渐变（左上亮 → 中段透明 → 右下微亮）
+  const sheen = ctx.createLinearGradient(0, 0, W, H);
+  sheen.addColorStop(0, `rgba(255, 255, 255, ${0.22 * a + 0.04})`);
+  sheen.addColorStop(0.32, `rgba(255, 255, 255, ${0.05 * a})`);
+  sheen.addColorStop(0.68, 'rgba(255, 255, 255, 0)');
+  sheen.addColorStop(1, `rgba(255, 255, 255, ${0.09 * a + 0.02})`);
+  ctx.fillStyle = sheen;
+  ctx.fill(path);
+
+  // 3) 内侧柔光（宽描边在 clip 内只留内半，形成玻璃厚度辉光）
+  ctx.strokeStyle = `rgba(255, 255, 255, ${0.08 * a + 0.03})`;
+  ctx.lineWidth = Math.max(3, cell * 0.06);
+  ctx.stroke(path);
+}
+
 /** 载入舞台图并为每块生成离屏切片 + 命中路径（按块数 2~3 倍超采样，缩放查看不模糊） */
 export async function buildPieceShapes(
   spec: ShapeSpec,
   stageDataUrl: string,
+  opts: BuildShapeOptions = {},
 ): Promise<BuiltPieceShape[]> {
   const img = new Image();
   img.src = stageDataUrl;
   await img.decode();
+  const glass = opts.glass !== false;
+  const blur = glass ? buildBlurredStage(img) : null;
 
   const { rows, cols, stageW, stageH, margin } = spec;
   const cw = stageW / cols;
@@ -194,16 +277,23 @@ export async function buildPieceShapes(
     const sh = Math.min(stageH, (r + 1) * ch + margin) - sy;
     const dx = sx - (c * cw - margin);
     const dy = sy - (r * ch - margin);
+    const W = cw + margin * 2;
+    const H = ch + margin * 2;
     ctx.save();
     ctx.clip(path);
     ctx.drawImage(img, sx, sy, sw, sh, dx, dy, sw, sh);
+    if (blur) paintGlass(ctx, path, blur, c * cw - margin, r * ch - margin, W, H, Math.min(cw, ch));
     ctx.restore();
-    // 沿路径描边，增强拼块轮廓
+    // 深色定形描边 + 菲涅尔亮边（对角渐变：左上强、右下弱）
     ctx.strokeStyle = 'rgba(0, 0, 0, 0.28)';
     ctx.lineWidth = 2;
     ctx.stroke(path);
-    ctx.strokeStyle = 'rgba(255, 255, 255, 0.22)';
-    ctx.lineWidth = 1;
+    const rim = ctx.createLinearGradient(0, 0, W, H);
+    rim.addColorStop(0, 'rgba(255, 255, 255, 0.5)');
+    rim.addColorStop(0.45, 'rgba(255, 255, 255, 0.16)');
+    rim.addColorStop(1, 'rgba(255, 255, 255, 0.1)');
+    ctx.strokeStyle = rim;
+    ctx.lineWidth = 1.5;
     ctx.stroke(path);
     out.push({ canvas, path, scale: dpr });
   }

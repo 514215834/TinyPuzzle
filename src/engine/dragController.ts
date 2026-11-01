@@ -11,7 +11,8 @@ export interface DragCallbacks {
   pickAt: (clientX: number, clientY: number) => HTMLElement | null;
   /**
    * 释放结算。targetCell 为命中格（自由摆放模式下为块中心所在格）；
-   * cx / cy 为块中心的棋盘坐标（自由摆放吸附判定用）。
+   * cx / cy 为块中心的棋盘坐标（自由摆放吸附判定用）；
+   * velocity 为松手速度（棋盘局部 px/s，鼠标停顿后松手为 0），物理碰撞用（F-511）。
    * 引擎状态在回调内更新，动画由视图层依据返回值播放。
    */
   drop: (
@@ -21,9 +22,12 @@ export interface DragCallbacks {
     dy: number,
     cx: number,
     cy: number,
+    velocity?: { vx: number; vy: number },
   ) => DropOutcome;
   /** 拖拽悬停信息变化（块 id + 目标格 + 块中心），null 表示无有效目标 */
   hoverChange: (info: { pieceId: number; cell: number | null; cx: number; cy: number } | null) => void;
+  /** 拖拽移动（每次 pointermove）：块中心棋盘坐标 + 平滑速度，物理碰撞同步 kinematic 用（F-511） */
+  dragMove?: (pieceId: number, cx: number, cy: number, vx: number, vy: number) => void;
   /** 旋转请求（F-303，双击 / 长按触发）；未启用旋转时不传 */
   rotate?: (pieceId: number) => void;
 }
@@ -42,11 +46,15 @@ interface DragSession {
   pointerType: string;
   lastDx: number;
   lastDy: number;
+  /** 速度采样（棋盘局部 px）：滑窗口内首尾差分估算松手速度（F-511） */
+  samples: Array<{ t: number; dx: number; dy: number }>;
 }
 
 const LONG_PRESS_MS = 480;
 const LONG_PRESS_TOLERANCE = 8;
 const PICK_GRACE = 8;
+/** 速度估算窗口：超过该时长的采样被淘汰；松手时采样过期视为静止 */
+const VELOCITY_WINDOW_MS = 110;
 
 /**
  * 拖拽控制（F-004）：Pointer Events 统一鼠标 / 触屏，
@@ -149,6 +157,7 @@ export class DragController {
       pointerType: e.pointerType,
       lastDx: 0,
       lastDy: 0,
+      samples: [{ t: performance.now(), dx: 0, dy: 0 }],
     };
     el.classList.add('dragging');
     el.style.zIndex = '30';
@@ -207,7 +216,24 @@ export class DragController {
       s.target = target;
       this.cb.hoverChange({ pieceId: s.pieceId, cell: target, cx, cy });
     }
+
+    // 速度采样 + 拖拽移动回调（物理碰撞 F-511）
+    const now = performance.now();
+    s.samples.push({ t: now, dx, dy });
+    while (s.samples.length > 2 && now - s.samples[0].t > VELOCITY_WINDOW_MS) s.samples.shift();
+    const v = DragController.velocityOf(s);
+    this.cb.dragMove?.(s.pieceId, cx, cy, v.vx, v.vy);
   };
+
+  /** 窗口内首尾差分估算速度（棋盘局部 px/s）；窗口内无位移差则视为 0 */
+  private static velocityOf(s: DragSession): { vx: number; vy: number } {
+    const a = s.samples[0];
+    const b = s.samples[s.samples.length - 1];
+    if (!a || a === b) return { vx: 0, vy: 0 };
+    const dt = (b.t - a.t) / 1000;
+    if (dt < 0.008) return { vx: 0, vy: 0 };
+    return { vx: (b.dx - a.dx) / dt, vy: (b.dy - a.dy) / dt };
+  }
 
   private currentRot(el: HTMLElement): string {
     const rot = Number(el.dataset.rot ?? 0);
@@ -227,7 +253,11 @@ export class DragController {
     const dy = (e.clientY - s.startY) / scale;
     const { cx, cy } = this.centerOf(s, dx, dy);
     const target = cancelled ? s.startCell : (s.target ?? s.startCell);
-    this.cb.drop(s.pieceId, target, dx, dy, cx, cy);
+    // 停顿后松手视为静止（最后一帧采样已过期）
+    const last = s.samples[s.samples.length - 1];
+    const stale = !last || performance.now() - last.t > VELOCITY_WINDOW_MS;
+    const v = stale ? { vx: 0, vy: 0 } : DragController.velocityOf(s);
+    this.cb.drop(s.pieceId, target, dx, dy, cx, cy, v);
   }
 
   private onUp = (e: PointerEvent): void => {

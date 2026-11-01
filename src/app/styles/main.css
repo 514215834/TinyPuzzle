@@ -124,8 +124,10 @@ button {
   height: 40px;
   padding: 0;
   border-radius: 10px;
-  border: 1px solid var(--border);
-  background: rgba(255, 255, 255, 0.07);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(255, 255, 255, 0.06);
+  -webkit-backdrop-filter: blur(10px) saturate(1.2);
+  backdrop-filter: blur(10px) saturate(1.2);
   cursor: pointer;
   font-size: 17px;
   line-height: 1;
@@ -545,10 +547,20 @@ button {
 #board {
   position: relative;
   border-radius: 14px;
-  background-color: rgba(0, 0, 0, 0.28);
+  background-color: rgba(10, 12, 26, 0.42); /* 玻璃托盘（F-510）：半透明底 + 背景模糊 */
   background-size: 33.33% 33.33%;
-  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.45), inset 0 0 0 1px rgba(255, 255, 255, 0.07);
+  -webkit-backdrop-filter: blur(18px) saturate(1.25);
+  backdrop-filter: blur(18px) saturate(1.25);
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.45), inset 0 0 0 1px rgba(255, 255, 255, 0.12),
+    inset 0 1px 0 rgba(255, 255, 255, 0.1);
   touch-action: none; /* 触屏拖拽时不触发页面滚动/缩放（F-201） */
+}
+
+/* 玻璃托盘回退：不支持 backdrop-filter 时用更实的底色保证网格可读 */
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  #board {
+    background-color: rgba(13, 15, 30, 0.9);
+  }
 }
 
 .grid-lines {
@@ -625,7 +637,8 @@ button {
 }
 
 .piece.shaped.dragging .piece-canvas {
-  filter: drop-shadow(0 14px 22px rgba(0, 0, 0, 0.55));
+  /* 拿起透光感（F-510）：玻璃块提起时更亮更透 */
+  filter: drop-shadow(0 14px 22px rgba(0, 0, 0, 0.55)) brightness(1.07) saturate(1.12);
 }
 
 /* 键盘无障碍（F-402）：光标与拾起态 */
@@ -883,12 +896,15 @@ button {
   backface-visibility: hidden;
   -webkit-backface-visibility: hidden;
   border-radius: 10px;
-  background: linear-gradient(145deg, #3d4663, #2c3350);
-  border: 1px solid rgba(255, 255, 255, 0.14);
-  color: rgba(255, 255, 255, 0.85);
+  /* 磨砂玻璃卡背（F-510） */
+  background: linear-gradient(145deg, rgba(88, 100, 140, 0.55), rgba(38, 45, 72, 0.65));
+  -webkit-backdrop-filter: blur(6px);
+  backdrop-filter: blur(6px);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  color: rgba(255, 255, 255, 0.88);
   font-weight: 700;
   letter-spacing: 0.5px;
-  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.2);
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.2), inset 0 1px 0 rgba(255, 255, 255, 0.14);
 }
 
 .icon-btn.active {

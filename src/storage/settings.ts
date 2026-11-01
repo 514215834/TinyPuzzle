@@ -18,6 +18,8 @@ export interface Settings {
   soundOn: boolean;
   /** 网格 / 拼图编码显示（默认关；开启后网格显示 A1 编码、块可双击翻面查看编码） */
   gridCodes: boolean;
+  /** 桌面物理碰撞（F-511，默认开）：散落块可被推动 / 丢掷滑行 / 边缘反弹 */
+  physicsOn: boolean;
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -27,6 +29,7 @@ export const DEFAULT_SETTINGS: Settings = {
   hintOpacity: 0.2,
   soundOn: true,
   gridCodes: false,
+  physicsOn: true,
 };
 
 const KEY = 'tp.settings';
@@ -50,6 +53,7 @@ export function loadSettings(): Settings {
     hintOpacity: Math.min(0.6, Math.max(0.05, Number(raw.hintOpacity) || DEFAULT_SETTINGS.hintOpacity)),
     soundOn: clampBool(raw.soundOn, DEFAULT_SETTINGS.soundOn),
     gridCodes: clampBool(raw.gridCodes, DEFAULT_SETTINGS.gridCodes),
+    physicsOn: clampBool(raw.physicsOn, DEFAULT_SETTINGS.physicsOn),
   };
 }
 

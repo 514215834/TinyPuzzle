@@ -2,6 +2,8 @@ import { playTone } from '../audio';
 import { startConfetti } from '../components/confetti';
 import { DragController } from '../../engine/dragController';
 import { PuzzleEngine } from '../../engine/game';
+import type { PhysRect } from '../../engine/physics';
+import { PhysWorld } from '../../engine/physics';
 import { buildPieceShapes, buildShapeSpec } from '../../engine/shaper';
 import { StatsService, formatMs } from '../../engine/stats';
 import type { DropOutcome } from '../../engine/types';
@@ -51,6 +53,7 @@ export class GameView {
   private readonly btnHint: HTMLButtonElement;
   private readonly btnLock: HTMLButtonElement;
   private readonly btnCode: HTMLButtonElement;
+  private readonly btnPhysics: HTMLButtonElement;
   private readonly btnHelp: HTMLButtonElement;
   private readonly btnShare: HTMLButtonElement;
 
@@ -71,6 +74,15 @@ export class GameView {
   private hitCtx: CanvasRenderingContext2D | null = null;
   private freePos = new Map<number, { x: number; y: number }>();
   private hintsLeft = MAX_HINTS;
+
+  // F-511 桌面物理：散置块的俯视碰撞（世界坐标 = 棋盘局部 px）
+  private phys: PhysWorld | null = null;
+  private physRunning = false;
+  private physRaf = 0;
+  private physLast = 0;
+  /** 拖拽中的块（kinematic body），无则 null */
+  private physHeldId: number | null = null;
+  private physHeldMovedAt = 0;
 
   private readonly onResize = (): void => {
     this.fitBoard();
@@ -103,6 +115,7 @@ export class GameView {
     this.btnHint = must(root.querySelector<HTMLButtonElement>('#btn-hint'), '#btn-hint');
     this.btnLock = must(root.querySelector<HTMLButtonElement>('#btn-lock'), '#btn-lock');
     this.btnCode = must(root.querySelector<HTMLButtonElement>('#btn-code'), '#btn-code');
+    this.btnPhysics = must(root.querySelector<HTMLButtonElement>('#btn-physics'), '#btn-physics');
     this.btnHelp = must(root.querySelector<HTMLButtonElement>('#btn-help'), '#btn-help');
     this.btnShare = must(document.querySelector<HTMLButtonElement>('#btn-share'), '#btn-share');
 
@@ -139,6 +152,17 @@ export class GameView {
     this.btnCode.addEventListener('click', () => {
       this.settings = saveSettings({ gridCodes: !this.settings.gridCodes });
       this.renderCellCodes();
+      this.syncToggleButtons();
+    });
+    this.btnPhysics.addEventListener('click', () => {
+      this.settings = saveSettings({ physicsOn: !this.settings.physicsOn });
+      if (this.settings.physicsOn) this.initPhysics();
+      else {
+        this.stopPhysLoop();
+        this.phys?.clear();
+        this.phys = null;
+        this.physHeldId = null;
+      }
       this.syncToggleButtons();
     });
     this.btnHelp.addEventListener('click', () => this.useHint());
@@ -534,9 +558,11 @@ export class GameView {
       pickAt: this.pickAt,
       drop: this.drop,
       hoverChange: this.hoverChange,
+      dragMove: this.onDragMove,
       rotate: rotationEnabled ? this.rotate : undefined,
     });
     this.clampAllFreePos();
+    this.initPhysics();
     this.saveProgressNow();
 
     // 开局入场动画（F-202）
@@ -556,6 +582,10 @@ export class GameView {
     this.shapes = null;
     this.freePos.clear();
     this.animating = false;
+    this.stopPhysLoop();
+    this.phys?.clear();
+    this.phys = null;
+    this.physHeldId = null;
     const cellCodes = document.getElementById('cell-codes');
     if (cellCodes) cellCodes.classList.add('hidden');
     this.resetViewport();
@@ -749,9 +779,10 @@ export class GameView {
     dy: number,
     cx: number,
     cy: number,
+    velocity?: { vx: number; vy: number },
   ): DropOutcome => {
     if (this.session?.opts.mode === 'free') {
-      this.handleFreeDrop(pieceId, dx, dy, cx, cy);
+      this.handleFreeDrop(pieceId, dx, dy, cx, cy, velocity);
       return { type: 'snapback' }; // 自由模式不使用交换结算
     }
 
@@ -814,7 +845,7 @@ export class GameView {
   }
 
   /** 自由摆放落子（F-302）：正确格吸附锁定；落在棋盘内吸附到所在格；其余原地散置 */
-  private handleFreeDrop(pieceId: number, dx: number, dy: number, cx: number, cy: number): void {
+  private handleFreeDrop(pieceId: number, dx: number, dy: number, cx: number, cy: number, velocity?: { vx: number; vy: number }): void {
     const engine = must(this.engine, '引擎未初始化');
     const el = must(this.pieceEl(pieceId), '拖拽块元素缺失');
     const { w: lw, h: lh } = this.localSize();
@@ -823,6 +854,7 @@ export class GameView {
     const { mx, my } = this.marginPx({ width: lw, height: lh });
     const p = engine.piece(pieceId);
     const { x: oldLeft, y: oldTop } = this.elementPosPx(el, lw, lh);
+    this.physHeldId = null; // 拖拽结束
 
     // 拖拽回调的 cx/cy 坐标基准分两种（见 DragController.centerOf）：
     // 格上块按格中心（已含 margin 修正）；散置块按元素左上角（需加回 margin 才是格子部分中心）
@@ -839,6 +871,7 @@ export class GameView {
     if (Math.hypot(px - ccx, py - ccy) < threshold && rotOk && !this.cellOccupied(p.id, pieceId)) {
       const outcome = engine.lockPiece(pieceId);
       engine.countMove();
+      this.phys?.removeBody(pieceId); // 已定位块退出物理世界
       const newLeft = ccx - cw / 2 - mx;
       const newTop = ccy - ch / 2 - my;
       this.settleTo(el, pieceId, dx, dy, oldLeft, oldTop, newLeft, newTop, '30');
@@ -861,6 +894,7 @@ export class GameView {
     if (onBoard && target !== p.cell && !this.cellOccupied(target, pieceId)) {
       engine.placeOnCell(pieceId, target);
       engine.countMove();
+      this.phys?.removeBody(pieceId); // 已定位块退出物理世界
       const cellLeft = col * cw - mx;
       const cellTop = row * ch - my;
       this.settleTo(el, pieceId, dx, dy, oldLeft, oldTop, cellLeft, cellTop, '20');
@@ -893,6 +927,136 @@ export class GameView {
     this.later(() => this.syncPieces(), ANIM_MS);
     playTone('drop', this.settings.soundOn);
     this.scheduleSave();
+
+    // 物理散置（F-511）：注入松手速度，块带惯性滑行 / 推挤邻居 / 撞墙反弹后入睡。
+    // physicsOn 关闭时 world 为 null，行为完全回退为静置。
+    if (this.phys) {
+      if (!this.phys.has(pieceId)) {
+        // 从棋盘拖出的块此前不在物理世界里，先补建
+        this.phys.ensureBody(pieceId, clampedX + box.w / 2, clampedY + box.h / 2, this.physRadius());
+      }
+      const launched = this.phys.launch(
+        pieceId,
+        clampedX + box.w / 2,
+        clampedY + box.h / 2,
+        velocity?.vx ?? 0,
+        velocity?.vy ?? 0,
+      );
+      if (launched) this.startPhysLoop();
+    }
+  }
+
+  // ---------- 桌面物理（F-511） ----------
+
+  /** 散落场地即物理边界（棋盘局部 px） */
+  private physBounds(): PhysRect {
+    const f = this.fieldRect();
+    return { x: f.fx, y: f.fy, w: f.fw, h: f.fh };
+  }
+
+  /** 物理碰撞半径：块占位盒（含异形留白）短边的圆近似 */
+  private physRadius(): number {
+    const box = this.freePieceBox();
+    return Math.min(box.w, box.h) * 0.46;
+  }
+
+  /**
+   * 构建 / 重建物理世界：散置块全部以 static 入场（静置不互挤），
+   * 被拖拽、丢掷或碰撞时才转 dynamic。
+   */
+  private initPhysics(): void {
+    this.stopPhysLoop();
+    this.phys = null;
+    this.physHeldId = null;
+    if (!this.settings.physicsOn || !this.engine) return;
+    if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+    if (this.localSize().w === 0 || this.wrap.getBoundingClientRect().width === 0) {
+      // 棋盘尚未量到尺寸（与 scatterFree 同款推迟），量到后重建
+      this.rAF(() => {
+        if (this.engine && this.settings.physicsOn) this.initPhysics();
+      });
+      return;
+    }
+    const world = new PhysWorld();
+    world.setBounds(this.physBounds());
+    const r = this.physRadius();
+    const box = this.freePieceBox();
+    for (const p of this.engine.getPieces()) {
+      if (p.cell >= 0) continue;
+      const pos = this.freePos.get(p.id);
+      if (pos) world.ensureBody(p.id, pos.x + box.w / 2, pos.y + box.h / 2, r);
+    }
+    this.phys = world;
+  }
+
+  /** 拖拽移动：被拖块作为 kinematic 同步进物理世界，推挤散落邻居 */
+  private onDragMove = (pieceId: number, cx: number, cy: number, vx: number, vy: number): void => {
+    const phys = this.phys;
+    const engine = this.engine;
+    if (!phys || !engine) return;
+    const { w: lw, h: lh } = this.localSize();
+    const { mx, my } = this.marginPx({ width: lw, height: lh });
+    const p = engine.piece(pieceId);
+    const off = p.cell < 0 ? { x: mx, y: my } : { x: 0, y: 0 };
+    const bx = cx + off.x;
+    const by = cy + off.y;
+    if (!phys.has(pieceId)) phys.ensureBody(pieceId, bx, by, this.physRadius());
+    phys.setKinematic(pieceId, bx, by, vx, vy);
+    this.physHeldId = pieceId;
+    this.physHeldMovedAt = performance.now();
+    this.startPhysLoop();
+  };
+
+  /** 物理主循环：有醒着的 body 才跑；每帧把移动过的块写回 left/top 与 freePos */
+  private readonly physLoop = (now: number): void => {
+    const phys = this.phys;
+    if (!phys || !this.physRunning) return;
+    const dt = this.physLast ? Math.min(0.05, (now - this.physLast) / 1000) : 0;
+    this.physLast = now;
+    // 指针停住后清零 kinematic 速度，避免持续推挤
+    if (this.physHeldId !== null && now - this.physHeldMovedAt > 90) phys.haltKinematic(this.physHeldId);
+    const movedIds = phys.step(dt);
+    if (movedIds.length) {
+      const box = this.freePieceBox();
+      const half = { w: box.w / 2, h: box.h / 2 };
+      for (const id of movedIds) {
+        if (id === this.physHeldId) continue; // 拖拽块位置由指针控制
+        const pos = phys.bodyPos(id);
+        if (!pos) continue;
+        const x = pos.x - half.w;
+        const y = pos.y - half.h;
+        this.freePos.set(id, { x, y });
+        const el = this.pieceEl(id);
+        if (el) {
+          el.style.left = `${x}px`;
+          el.style.top = `${y}px`;
+          el.dataset.px = String(x);
+          el.dataset.py = String(y);
+        }
+      }
+    }
+    if (phys.isSettled && this.physHeldId === null) {
+      this.physRunning = false;
+      this.physRaf = 0;
+      this.scheduleSave(); // 静置后的散布位置入快照
+      return;
+    }
+    this.physRaf = requestAnimationFrame(this.physLoop);
+  };
+
+  private startPhysLoop(): void {
+    if (this.physRunning || !this.phys) return;
+    this.physRunning = true;
+    this.physLast = performance.now();
+    this.physRaf = requestAnimationFrame(this.physLoop);
+  }
+
+  private stopPhysLoop(): void {
+    this.physRunning = false;
+    if (this.physRaf) {
+      cancelAnimationFrame(this.physRaf);
+      this.physRaf = 0;
+    }
   }
 
   private hoverChange = (info: { pieceId: number; cell: number | null; cx: number; cy: number } | null): void => {
@@ -1170,6 +1334,9 @@ export class GameView {
     this.btnCode.textContent = 'A1';
     this.btnCode.title = this.settings.gridCodes ? t('titleGridOn') : t('titleGridOff');
     this.btnCode.classList.toggle('active', this.settings.gridCodes);
+    this.btnPhysics.textContent = '🎱';
+    this.btnPhysics.title = this.settings.physicsOn ? t('titlePhysicsOn') : t('titlePhysicsOff');
+    this.btnPhysics.classList.toggle('off', !this.settings.physicsOn);
   }
 
   // ---------- 操作入口 ----------
@@ -1180,6 +1347,7 @@ export class GameView {
     this.engine.reshuffle();
     this.hintsLeft = MAX_HINTS;
     if (this.session?.opts.mode === 'free') this.scatterFree();
+    this.initPhysics();
     this.stats.start();
     this.syncPieces();
     this.hideDialog();
@@ -1262,6 +1430,7 @@ export class GameView {
         if (!this.engine) return; // 已卸载
         this.scatterFree();
         this.syncPieces(); // 散布完成后补一次同步，把块摆到散布位置
+        this.initPhysics(); // 散布位置就绪后再建物理世界
       });
       return;
     }
@@ -1302,6 +1471,16 @@ export class GameView {
         el.style.top = `${pos.y}px`;
         el.dataset.px = String(pos.x);
         el.dataset.py = String(pos.y);
+      }
+    }
+    // 物理世界同步：边界更新 + 静置块位置对齐（运动中的块交由边界反弹接管）
+    if (this.phys) {
+      this.phys.setBounds(this.physBounds());
+      this.phys.clampIntoBounds();
+      for (const p of this.engine.getPieces()) {
+        if (p.cell >= 0) continue;
+        const pos = this.freePos.get(p.id);
+        if (pos) this.phys.placeStatic(p.id, pos.x + box.w / 2, pos.y + box.h / 2);
       }
     }
   }
