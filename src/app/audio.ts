@@ -17,7 +17,7 @@ export function unlockAudio(): void {
   }
 }
 
-type SoundName = 'pick' | 'drop' | 'correct' | 'win';
+type SoundName = 'pick' | 'drop' | 'correct' | 'win' | 'explosion';
 
 function tone(freq: number, startAt: number, dur: number, type: OscillatorType, gain: number): void {
   if (!ctx) return;
@@ -54,5 +54,41 @@ export function playTone(name: SoundName, enabled: boolean): void {
       tone(784, 0.24, 0.12, 'sine', 0.1);
       tone(1047, 0.36, 0.28, 'sine', 0.12);
       break;
+    case 'explosion':
+      explosionSound();
+      break;
   }
+}
+
+/** 开局爆散音（F-512）：低频扫频冲击 + 白噪爆裂，Web Audio 合成 */
+function explosionSound(): void {
+  if (!ctx) return;
+  const t0 = ctx.currentTime;
+  // 低频冲击：170Hz → 38Hz 指数下扫，模拟「咚」的低音冲击
+  const osc = ctx.createOscillator();
+  const og = ctx.createGain();
+  osc.type = 'sine';
+  osc.frequency.setValueAtTime(170, t0);
+  osc.frequency.exponentialRampToValueAtTime(38, t0 + 0.42);
+  og.gain.setValueAtTime(0.24, t0);
+  og.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.5);
+  osc.connect(og).connect(ctx.destination);
+  osc.start(t0);
+  osc.stop(t0 + 0.52);
+  // 噪声爆裂：白噪经低通渐闭，模拟碎石飞溅
+  const len = Math.floor(ctx.sampleRate * 0.3);
+  const buf = ctx.createBuffer(1, len, ctx.sampleRate);
+  const data = buf.getChannelData(0);
+  for (let i = 0; i < len; i++) data[i] = (Math.random() * 2 - 1) * (1 - i / len);
+  const src = ctx.createBufferSource();
+  src.buffer = buf;
+  const lp = ctx.createBiquadFilter();
+  lp.type = 'lowpass';
+  lp.frequency.setValueAtTime(3200, t0);
+  lp.frequency.exponentialRampToValueAtTime(220, t0 + 0.3);
+  const ng = ctx.createGain();
+  ng.gain.setValueAtTime(0.32, t0);
+  ng.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.32);
+  src.connect(lp).connect(ng).connect(ctx.destination);
+  src.start(t0);
 }

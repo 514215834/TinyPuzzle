@@ -595,6 +595,97 @@ button {
   }
 }
 
+/* ---------- 开局爆散开场（F-206）：白闪 + 冲击波 + 震屏 ---------- */
+
+/* 冲击波光环：由爆心扩张的亮环，尺寸由 JS 按棋盘大小设定 */
+.shockwave {
+  position: absolute;
+  border-style: solid;
+  border-color: rgba(255, 226, 168, 0.9);
+  border-radius: 50%;
+  pointer-events: none;
+  z-index: 60;
+  opacity: 0;
+  animation: shockwave 0.68s cubic-bezier(0.17, 0.84, 0.44, 1) forwards;
+  will-change: transform, opacity;
+}
+
+@keyframes shockwave {
+  0% {
+    transform: translate(-50%, -50%) scale(0.05);
+    opacity: 0.95;
+    border-width: 22px;
+    box-shadow: 0 0 60px rgba(255, 190, 110, 0.55);
+  }
+  60% {
+    opacity: 0.6;
+  }
+  100% {
+    transform: translate(-50%, -50%) scale(1);
+    opacity: 0;
+    border-width: 1px;
+    box-shadow: 0 0 0 rgba(255, 190, 110, 0);
+  }
+}
+
+/* 爆心白闪：径向渐变快速点亮再熄灭 */
+.board-flash {
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(
+    circle at 50% 50%,
+    rgba(255, 255, 255, 0.95),
+    rgba(255, 236, 200, 0.55) 45%,
+    rgba(255, 255, 255, 0) 78%
+  );
+  pointer-events: none;
+  z-index: 61;
+  opacity: 0;
+  animation: boardFlash 0.5s ease-out forwards;
+}
+
+@keyframes boardFlash {
+  0% {
+    opacity: 0;
+  }
+  12% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+  }
+}
+
+/* 震屏：爆炸瞬间整个场地抖动，衰减收尾 */
+.board-wrap.shaking {
+  animation: boardShake 0.5s cubic-bezier(0.36, 0.07, 0.19, 0.97) both;
+}
+
+@keyframes boardShake {
+  0%,
+  100% {
+    transform: translate3d(0, 0, 0);
+  }
+  12% {
+    transform: translate3d(-9px, 5px, 0);
+  }
+  26% {
+    transform: translate3d(8px, -6px, 0);
+  }
+  40% {
+    transform: translate3d(-7px, -4px, 0);
+  }
+  55% {
+    transform: translate3d(5px, 4px, 0);
+  }
+  70% {
+    transform: translate3d(-3px, 2px, 0);
+  }
+  85% {
+    transform: translate3d(2px, -1px, 0);
+  }
+}
+
 .piece.dragging {
   /* 拖拽中 transform 跟手，不参与过渡 */
   transition: box-shadow 0.2s ease;

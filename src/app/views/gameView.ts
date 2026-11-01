@@ -6,7 +6,7 @@ import type { PhysRect } from '../../engine/physics';
 import { PhysWorld } from '../../engine/physics';
 import { buildPieceShapes, buildShapeSpec } from '../../engine/shaper';
 import { StatsService, formatMs } from '../../engine/stats';
-import type { DropOutcome } from '../../engine/types';
+import type { DropOutcome, PuzzlePiece } from '../../engine/types';
 import { clearProgress, saveProgress } from '../../storage/progress';
 import { submitResult } from '../../storage/records';
 import { loadSettings, saveSettings } from '../../storage/settings';
@@ -18,6 +18,12 @@ import type { GameSession } from '../session';
 const ANIM_MS = 240;
 /** 开局入场动画时长 */
 const ENTER_MS = 950;
+/** 爆散开场（F-512）各阶段时长：完整亮相 → 定格蓄力 → 爆散飞落 */
+const INTRO_REVEAL_MS = 420; // 完整拼图整体淡入亮相
+const INTRO_HOLD_MS = 520; // 定格蓄力，给玩家看清原图的时间
+const INTRO_FLY_MS = 760; // 碎块爆散飞行
+const INTRO_STAGGER_MS = 110; // 冲击波由内向外传播的起爆延迟上限
+const INTRO_TOTAL_MS = INTRO_REVEAL_MS + INTRO_HOLD_MS + INTRO_STAGGER_MS + INTRO_FLY_MS + 80;
 /** 进度快照节流间隔 */
 const SAVE_THROTTLE_MS = 400;
 /** 吸附阈值系数（架构文档 §7.5） */
@@ -65,6 +71,8 @@ export class GameView {
   private rows = 3;
   private cols = 3;
   private animating = false;
+  /** 爆散开场进行中（块位置由开场动画接管，禁止夹取/同步干扰） */
+  private introPlaying = false;
   private timers: number[] = [];
   private saveTimer: number | undefined;
 
@@ -551,7 +559,9 @@ export class GameView {
       }
     }
 
-    await this.buildPieces();
+    const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    const intro = !saved && !reducedMotion; // 新局才播爆散开场；续局与减动效走错落入场
+    await this.buildPieces(intro);
     if (!this.session || !this.engine) return; // 构建期间被卸载，不再继续挂载
     this.controller = new DragController(this.board, { rows: this.rows, cols: this.cols }, {
       canPick: this.canPick,
@@ -565,11 +575,15 @@ export class GameView {
     this.initPhysics();
     this.saveProgressNow();
 
-    // 开局入场动画（F-202）
-    this.animating = true;
-    this.later(() => {
-      this.animating = false;
-    }, ENTER_MS);
+    // 开局入场动画（F-202 / F-512）：新局播「完整图亮相 → 爆散」开场，其余走错落入场
+    if (intro) {
+      this.playExplosionIntro();
+    } else {
+      this.animating = true;
+      this.later(() => {
+        this.animating = false;
+      }, ENTER_MS);
+    }
     this.timers.push(window.setInterval(this.tick, 500));
   }
 
@@ -582,6 +596,7 @@ export class GameView {
     this.shapes = null;
     this.freePos.clear();
     this.animating = false;
+    this.introPlaying = false;
     this.stopPhysLoop();
     this.phys?.clear();
     this.phys = null;
@@ -601,7 +616,7 @@ export class GameView {
 
   // ---------- 构建 / 同步 ----------
 
-  private async buildPieces(): Promise<void> {
+  private async buildPieces(intro: boolean): Promise<void> {
     const stage = must(this.session, '对局参数缺失').stage;
     const engine = must(this.engine, '引擎未初始化');
 
@@ -616,14 +631,20 @@ export class GameView {
 
     for (const p of engine.getPieces()) {
       const el = document.createElement('div');
-      el.className = 'piece enter';
+      el.className = 'piece';
       el.dataset.pieceId = String(p.id);
       el.dataset.rot = String(p.rot);
       this.applyPieceGeometry(el, p.id);
-      // 大块数下按总量压缩入场间隔，整体入场控制在约 1.2s 内
-      const step = Math.min(18, Math.max(1, Math.round(1200 / engine.getPieces().length)));
-      el.style.animationDelay = `${p.id * step}ms`;
-      el.addEventListener('animationend', () => el.classList.remove('enter'), { once: true });
+      if (intro) {
+        // 爆散开场：先整体隐藏，亮相位姿由 playExplosionIntro 接管
+        el.style.opacity = '0';
+      } else {
+        el.classList.add('enter');
+        // 大块数下按总量压缩入场间隔，整体入场控制在约 1.2s 内
+        const step = Math.min(18, Math.max(1, Math.round(1200 / engine.getPieces().length)));
+        el.style.animationDelay = `${p.id * step}ms`;
+        el.addEventListener('animationend', () => el.classList.remove('enter'), { once: true });
+      }
       this.board.appendChild(el);
     }
     this.syncPieces();
@@ -707,6 +728,165 @@ export class GameView {
 
   private pieceEl(id: number): HTMLElement | null {
     return this.board.querySelector<HTMLElement>(`[data-piece-id="${id}"]`);
+  }
+
+  // ---------- 开局爆散开场（F-512） ----------
+
+  /** 碎块最终散点（棋盘局部 px）：自由摆放取散布点，交换式取格子左上角 */
+  private finalPiecePosPx(p: PuzzlePiece): { x: number; y: number } {
+    const { w: lw, h: lh } = this.localSize();
+    const { mx, my } = this.marginPx({ width: lw, height: lh });
+    if (this.session?.opts.mode === 'free' && p.cell < 0) {
+      const pos = this.freePos.get(p.id);
+      if (pos) return { x: pos.x, y: pos.y };
+    }
+    const cell = p.cell >= 0 ? p.cell : p.id; // 散布点缺失时退回正确格
+    return {
+      x: ((cell % this.cols) * lw) / this.cols - mx,
+      y: (Math.floor(cell / this.cols) * lh) / this.rows - my,
+    };
+  }
+
+  /**
+   * 开局爆散开场：完整拼图先整体亮相定格，随后白闪 + 冲击波 + 震屏，
+   * 碎块从爆心由内向外依次炸飞到各自散布点（带翻滚与回弹落定），约 1.9s。
+   * 期间 animating 拦截拖拽 / 键盘操作。
+   */
+  private playExplosionIntro(): void {
+    const engine = this.engine;
+    if (!engine) return;
+    const { w: lw, h: lh } = this.localSize();
+    if (lw === 0 || this.wrap.getBoundingClientRect().width === 0) {
+      this.rAF(() => {
+        if (this.engine) this.playExplosionIntro(); // 棋盘未量到尺寸（同 scatterFree 推迟），量到后重试
+      });
+      return;
+    }
+    const cw = lw / this.cols;
+    const ch = lh / this.rows;
+    const { mx, my } = this.marginPx({ width: lw, height: lh });
+    const cx = lw / 2;
+    const cy = lh / 2;
+    const maxD = Math.hypot(cx, cy) || 1;
+
+    // 预演算每块：完整图位（正确格）→ 最终散点的位移、起爆延迟（由内向外传播）与关键位姿。
+    // reveal/land 保持同一变换函数序列（translate3d → rotate → rotateY → scale），保证逐段平滑插值。
+    const flights: Array<{
+      el: HTMLElement;
+      fx: number;
+      fy: number;
+      dx: number;
+      dy: number;
+      delay: number;
+      reveal: string;
+      land: string;
+    }> = [];
+    for (const p of engine.getPieces()) {
+      const el = this.pieceEl(p.id);
+      if (!el) continue;
+      const ax = ((p.id % this.cols) * lw) / this.cols - mx; // 正确格左上角 = 完整图位
+      const ay = (Math.floor(p.id / this.cols) * lh) / this.rows - my;
+      const fin = this.finalPiecePosPx(p);
+      const dist = Math.min(1, Math.hypot(ax + cw / 2 - cx, ay + ch / 2 - cy) / maxD);
+      const rot = Number(el.dataset.rot ?? 0) * 90;
+      const flip = el.dataset.flipped === '1' ? ' rotateY(180deg)' : ' rotateY(0deg)';
+      flights.push({
+        el,
+        fx: fin.x,
+        fy: fin.y,
+        dx: fin.x - ax,
+        dy: fin.y - ay,
+        delay: Math.round(dist * INTRO_STAGGER_MS),
+        reveal: `translate3d(${-fin.x + ax}px, ${-fin.y + ay}px, 0) rotate(0deg)${flip} scale(1)`,
+        land: `translate3d(0, 0, 0) rotate(${rot}deg)${flip} scale(1)`,
+      });
+    }
+
+    this.animating = true;
+    this.introPlaying = true;
+
+    // 阶段一：碎块瞬移到完整图位姿（透明、微缩）→ 整体淡入放大亮相
+    for (const f of flights) {
+      const el = f.el;
+      el.classList.remove('locked'); // 重开时清掉上局的锁定态描边，完整图才干净
+      el.style.zIndex = '1';
+      el.classList.add('no-anim');
+      el.style.left = `${f.fx}px`;
+      el.style.top = `${f.fy}px`;
+      el.style.opacity = '0';
+      el.style.transform = f.reveal;
+      el.classList.remove('no-anim');
+      el.animate(
+        [
+          { opacity: 0, transform: f.reveal.replace(' scale(1)', ' scale(0.92)') },
+          { opacity: 1, transform: f.reveal },
+        ],
+        { duration: INTRO_REVEAL_MS, easing: 'cubic-bezier(0.22, 1, 0.36, 1)', fill: 'forwards' },
+      );
+    }
+
+    // 阶段二：定格蓄力后引爆——白闪 + 冲击波 + 震屏，碎块带随机翻滚向外炸飞
+    this.later(() => {
+      if (!this.engine) return; // 已卸载
+      this.spawnExplosionFx();
+      playTone('explosion', this.settings.soundOn);
+      for (const f of flights) {
+        const spin = Math.round(Math.random() * 56 - 28); // 起爆瞬间碎块的随机翻滚量
+        f.el.animate(
+          [
+            { transform: f.reveal, offset: 0, easing: 'cubic-bezier(0.5, 0, 0.75, 0.6)' },
+            {
+              transform: f.reveal
+                .replace('rotate(0deg)', `rotate(${spin}deg)`)
+                .replace(' scale(1)', ' scale(1.06)'),
+              offset: 0.14,
+              easing: 'cubic-bezier(0.16, 0.84, 0.26, 1.02)', // 快出缓收 + 轻微过冲回弹
+            },
+            { transform: f.land, offset: 1 },
+          ],
+          { duration: INTRO_FLY_MS, delay: f.delay, fill: 'both' },
+        );
+      }
+    }, INTRO_REVEAL_MS + INTRO_HOLD_MS);
+
+    // 阶段三：收尾——取消动画恢复常态，引擎同步 + 夹取 + 入快照
+    this.later(() => {
+      for (const f of flights) {
+        const el = f.el;
+        el.classList.add('no-anim');
+        el.style.opacity = '';
+        el.style.transform = this.poseSuffix(el);
+        el.classList.remove('no-anim');
+        for (const a of el.getAnimations()) a.cancel();
+      }
+      this.introPlaying = false;
+      this.animating = false;
+      this.syncPieces();
+      this.clampAllFreePos();
+      this.saveProgressNow();
+    }, INTRO_TOTAL_MS);
+  }
+
+  /** 爆炸瞬间特效：白闪 + 冲击波光环 + 场地震屏（CSS 动画结束自毁） */
+  private spawnExplosionFx(): void {
+    const { w: lw, h: lh } = this.localSize();
+    const ring = document.createElement('div');
+    ring.className = 'shockwave';
+    const d = Math.round(Math.max(lw, lh) * 2.5);
+    ring.style.width = `${d}px`;
+    ring.style.height = `${d}px`;
+    ring.style.left = `${lw / 2}px`;
+    ring.style.top = `${lh / 2}px`;
+    ring.addEventListener('animationend', () => ring.remove(), { once: true });
+    this.board.appendChild(ring);
+
+    const flash = document.createElement('div');
+    flash.className = 'board-flash';
+    flash.addEventListener('animationend', () => flash.remove(), { once: true });
+    this.board.appendChild(flash);
+
+    this.wrap.classList.add('shaking');
+    this.later(() => this.wrap.classList.remove('shaking'), 620); // 动画时长 0.5s + 兜底
   }
 
   // ---------- 命中测试（含异形路径，F-301） ----------
@@ -1342,16 +1522,20 @@ export class GameView {
   // ---------- 操作入口 ----------
 
   private restart(): void {
-    if (!this.engine) return;
+    if (!this.engine || this.animating) return; // 动画进行中不重开（避免开场序列重叠）
     this.board.classList.remove('solved');
     this.engine.reshuffle();
     this.hintsLeft = MAX_HINTS;
     if (this.session?.opts.mode === 'free') this.scatterFree();
     this.initPhysics();
     this.stats.start();
-    this.syncPieces();
     this.hideDialog();
     this.saveProgressNow();
+    if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+      this.syncPieces(); // 减动效：直接落位
+    } else {
+      this.playExplosionIntro(); // 重新打乱同样以爆散开场亮相
+    }
   }
 
   private hideHint(): void {
@@ -1455,6 +1639,7 @@ export class GameView {
 
   /** 视口尺寸变化后把散布块夹回场地内 */
   private clampAllFreePos(): void {
+    if (this.introPlaying) return; // 爆散开场进行中：位置由开场动画接管，结束后再夹取
     if (this.session?.opts.mode !== 'free' || !this.engine) return;
     if (this.localSize().w === 0 || this.wrap.getBoundingClientRect().width === 0) return;
     const box = this.freePieceBox();
