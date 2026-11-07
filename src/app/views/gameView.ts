@@ -30,6 +30,10 @@ const SAVE_THROTTLE_MS = 400;
 const SNAP_RATIO = 0.6;
 /** 提示次数上限（F-304） */
 const MAX_HINTS = 3;
+/** 提示脉冲时长（V1.5 F-515）：2s 强化脉冲后转常亮直至解除 */
+const HINT_PULSE_MS = 2000;
+/** 提示边缘箭头兜底刷新间隔（V1.5 F-514），其余更新由平移 / 缩放 / 物理滑行事件驱动 */
+const HINT_ARROW_FALLBACK_MS = 1000;
 
 /** 网格编码：列字母 + 行号（0,0→A1，1,0→B1，0,1→A2，26 列起 AA…） */
 function cellCode(col: number, row: number): string {
@@ -48,6 +52,9 @@ export class GameView {
   private readonly board: HTMLElement;
   private readonly wrap: HTMLElement;
   private readonly hintEl: HTMLElement;
+  private readonly hintCellEl: HTMLElement;
+  private readonly dropHintEl: HTMLElement;
+  private readonly arrowEl: HTMLElement;
   private readonly overlay: HTMLElement;
   private readonly resultSub: HTMLElement;
   private readonly resultRecords: HTMLElement;
@@ -85,6 +92,19 @@ export class GameView {
   private hitCtx: CanvasRenderingContext2D | null = null;
   private freePos = new Map<number, { x: number; y: number }>();
   private hintsLeft = MAX_HINTS;
+  // V1.5 提示体验专项（F-514 / F-515 / F-516）
+  /** 当前活动提示的块 id（null = 无活动提示；全场同时最多一个，F-515） */
+  private hintTargetId: number | null = null;
+  /** 被提示块处于手持中（F-515①）：拾起后块辉光 / 箭头暂隐、目标格转常亮保持，放置结算后才解除或恢复 */
+  private hintPickedUp = false;
+  /** 提示 2s 脉冲 → 常亮的切换定时器 */
+  private hintHoldTimer = 0;
+  /** 边缘箭头 1s 兜底刷新定时器（F-514） */
+  private hintArrowTimer = 0;
+  /** 箭头刷新节流时间戳（F-514：事件合并，不做每帧循环） */
+  private hintArrowLast = 0;
+  /** 被提示块的旋转角标元素（F-516） */
+  private hintBadgeEl: HTMLElement | null = null;
 
   // F-511 桌面物理：散置块的俯视碰撞（世界坐标 = 棋盘局部 px）
   private phys: PhysWorld | null = null;
@@ -122,6 +142,9 @@ export class GameView {
     this.board = must(root.querySelector<HTMLElement>('#board'), '#board');
     this.wrap = must(root.querySelector<HTMLElement>('#board-wrap'), '#board-wrap');
     this.hintEl = must(root.querySelector<HTMLElement>('#hint-overlay'), '#hint-overlay');
+    this.hintCellEl = must(root.querySelector<HTMLElement>('#hint-cell'), '#hint-cell');
+    this.dropHintEl = must(root.querySelector<HTMLElement>('#drop-hint'), '#drop-hint');
+    this.arrowEl = must(root.querySelector<HTMLElement>('#hint-arrow'), '#hint-arrow');
     this.overlay = must(document.querySelector<HTMLElement>('#result-overlay'), '#result-overlay');
     this.resultSub = must(document.querySelector<HTMLElement>('#result-sub'), '#result-sub');
     this.resultRecords = must(document.querySelector<HTMLElement>('#result-records'), '#result-records');
@@ -135,6 +158,7 @@ export class GameView {
     this.btnPhysics = must(root.querySelector<HTMLButtonElement>('#btn-physics'), '#btn-physics');
     this.btnHelp = must(root.querySelector<HTMLButtonElement>('#btn-help'), '#btn-help');
     this.btnShare = must(document.querySelector<HTMLButtonElement>('#btn-share'), '#btn-share');
+    this.board.style.transformOrigin = '0 0'; // 视口缩放 / 平移以左上为锚，一次写入即可（F-519）
 
     must(root.querySelector<HTMLButtonElement>('#btn-back'), '#btn-back').addEventListener('click', () => {
       location.hash = '#/';
@@ -265,16 +289,57 @@ export class GameView {
   private static readonly ZOOM_MIN = 0.5;
   private static readonly ZOOM_MAX = 6;
 
+  /**
+   * 视口手势期夹取常量（F-519）：wrap 视口矩形 + 棋盘未变换布局原点 / 布局尺寸。
+   * transform 不参与布局，手势内这些值恒定，手势开始时量测一次：
+   * - 消除每个 pointermove 2 次 getBoundingClientRect 的强制同步 flush（平移热路径遗留的 F-517 同族问题）；
+   * - 消除「读旧变换 rect 减已累加本次 delta 的新 pan」令夹取窗口随拖动方向偏移一个事件增量、
+   *   边界处冲过头再弹回的橡皮筋感。
+   */
+  private vpGeom: {
+    wrapLeft: number;
+    wrapTop: number;
+    wrapW: number;
+    wrapH: number;
+    /** 棋盘未变换布局原点（client 坐标） */
+    layoutLeft: number;
+    layoutTop: number;
+    /** 棋盘布局尺寸（offsetWidth/Height；视觉尺寸 = 布局尺寸 × zoom） */
+    bw0: number;
+    bh0: number;
+  } | null = null;
+
+  /** 手势开始时量测一次；此刻 panX/panY 与最近一次写入的 transform 一致，反推布局原点无偏差 */
+  private ensureVpGeom(): void {
+    if (this.vpGeom) return;
+    const wrapRect = this.wrap.getBoundingClientRect();
+    const rect = this.board.getBoundingClientRect();
+    this.vpGeom = {
+      wrapLeft: wrapRect.left,
+      wrapTop: wrapRect.top,
+      wrapW: wrapRect.width,
+      wrapH: wrapRect.height,
+      layoutLeft: rect.left - this.panX,
+      layoutTop: rect.top - this.panY,
+      bw0: this.board.offsetWidth,
+      bh0: this.board.offsetHeight,
+    };
+  }
+
+  private invalidateVpGeom(): void {
+    this.vpGeom = null;
+  }
+
   /** 棋盘视觉缩放系数（client px / 局部 px） */
   private scaleFactor(): number {
     const rect = this.board.getBoundingClientRect();
-    return rect.width / (this.board.offsetWidth || 1);
+    return rect.width / (this.localSize().w || 1);
   }
 
   private applyViewport(): void {
     this.controller?.invalidateLayout(); // 平移 / 缩放改变棋盘 client 原点，拖拽量测缓存失效（F-513）
-    this.board.style.transformOrigin = '0 0';
     this.board.style.transform = `translate(${this.panX}px, ${this.panY}px) scale(${this.zoom})`;
+    if (this.hintTargetId != null) this.updateHintArrow(); // F-514：视口变化后箭头跟随
   }
 
   private resetViewport(): void {
@@ -285,32 +350,29 @@ export class GameView {
     this.applyViewport();
   }
 
-  /** 以某个屏幕点为锚缩放（保持该点下的棋盘内容不动） */
+  /** 以某个屏幕点为锚缩放（保持该点下的棋盘内容不动；几何取手势期常量缓存，F-519） */
   private zoomAt(clientX: number, clientY: number, factor: number): void {
     if (!this.engine) return;
-    const rect = this.board.getBoundingClientRect();
-    const layoutLeft = rect.left - this.panX;
-    const layoutTop = rect.top - this.panY;
     const next = Math.min(GameView.ZOOM_MAX, Math.max(GameView.ZOOM_MIN, this.zoom * factor));
     if (next === this.zoom) return;
-    const localX = (clientX - layoutLeft - this.panX) / this.zoom;
-    const localY = (clientY - layoutTop - this.panY) / this.zoom;
+    this.ensureVpGeom();
+    const g = this.vpGeom!;
+    const localX = (clientX - g.layoutLeft - this.panX) / this.zoom;
+    const localY = (clientY - g.layoutTop - this.panY) / this.zoom;
     this.zoom = next;
-    this.panX = clientX - layoutLeft - localX * this.zoom;
-    this.panY = clientY - layoutTop - localY * this.zoom;
+    this.panX = clientX - g.layoutLeft - localX * this.zoom;
+    this.panY = clientY - g.layoutTop - localY * this.zoom;
     this.clampPan();
     this.applyViewport();
   }
 
-  /** 平移夹取：棋盘至少保留 60px 与场地相交；棋盘小于场地时居中 */
+  /** 平移夹取：棋盘至少保留 60px 与场地相交；棋盘小于场地时居中（几何取手势期常量缓存，F-519） */
   private clampPan(): void {
     if (!this.engine) return;
-    const wrapRect = this.wrap.getBoundingClientRect();
-    const rect = this.board.getBoundingClientRect();
-    const layoutLeft = rect.left - this.panX;
-    const layoutTop = rect.top - this.panY;
-    const bw = this.board.offsetWidth * this.zoom;
-    const bh = this.board.offsetHeight * this.zoom;
+    this.ensureVpGeom();
+    const g = this.vpGeom!;
+    const bw = g.bw0 * this.zoom;
+    const bh = g.bh0 * this.zoom;
     const margin = 60;
     const clampAxis = (layout: number, size: number, wrapStart: number, wrapSize: number, pan: number): number => {
       const min = wrapStart + margin - layout - size;
@@ -318,16 +380,20 @@ export class GameView {
       if (min > max) return wrapStart + wrapSize / 2 - layout - size / 2;
       return Math.min(max, Math.max(min, pan));
     };
-    this.panX = clampAxis(layoutLeft, bw, wrapRect.left, wrapRect.width, this.panX);
-    this.panY = clampAxis(layoutTop, bh, wrapRect.top, wrapRect.height, this.panY);
+    this.panX = clampAxis(g.layoutLeft, bw, g.wrapLeft, g.wrapW, this.panX);
+    this.panY = clampAxis(g.layoutTop, bh, g.wrapTop, g.wrapH, this.panY);
   }
 
   private readonly onWheel = (e: WheelEvent): void => {
     if (!this.engine) return;
     e.preventDefault();
-    this.wrap.classList.add('gesturing'); // 手势期降级 backdrop-filter，避免逐帧重光栅化（F-513）
+    this.wrap.classList.add('gesturing'); // 手势期降级 backdrop-filter + 整板提层，避免逐帧重光栅化（F-513/F-519）
+    this.ensureVpGeom(); // 滚轮突发起点量测夹取常量（F-519）
     window.clearTimeout(this.wheelGestureTimer);
-    this.wheelGestureTimer = window.setTimeout(() => this.wrap.classList.remove('gesturing'), 180);
+    this.wheelGestureTimer = window.setTimeout(() => {
+      this.wrap.classList.remove('gesturing');
+      this.invalidateVpGeom(); // 手势窗口结束释放（F-519）
+    }, 180);
     this.zoomAt(e.clientX, e.clientY, Math.exp(-e.deltaY * 0.0015));
   };
   private wheelGestureTimer: number | undefined;
@@ -338,7 +404,8 @@ export class GameView {
     this.viewportPointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
     if (this.viewportPointers.size === 1) {
       e.preventDefault();
-      this.wrap.classList.add('gesturing'); // 平移 / 双指缩放期间关闭玻璃模糊（F-513）
+      this.ensureVpGeom(); // 手势开始量测夹取常量：此刻 pan 与已写入 transform 一致，无偏差（F-519）
+      this.wrap.classList.add('gesturing'); // 平移 / 双指缩放期间关闭玻璃模糊 + 整板提层（F-513/F-519）
     }
   };
 
@@ -378,7 +445,10 @@ export class GameView {
 
   private readonly onViewportPointerUp = (e: PointerEvent): void => {
     this.viewportPointers.delete(e.pointerId);
-    if (this.viewportPointers.size === 0) this.wrap.classList.remove('gesturing');
+    if (this.viewportPointers.size === 0) {
+      this.invalidateVpGeom(); // 手势结束释放几何缓存（F-519）
+      this.wrap.classList.remove('gesturing');
+    }
   };
 
   // ---------- 键盘无障碍（F-402，交换式玩法）+ 旋转快捷键 ----------
@@ -502,6 +572,7 @@ export class GameView {
       const id = this.movableAt(this.cursorCell);
       if (id !== null) {
         this.heldId = id;
+        if (id === this.hintTargetId) this.suppressHintDuringDrag(); // F-515①：键盘拾起仅暂隐块辉光，目标格保持到放置结算
         this.renderCursor();
         playTone('pick', this.settings.soundOn);
       }
@@ -610,6 +681,7 @@ export class GameView {
   unmount(): void {
     this.controller?.destroy();
     this.controller = null;
+    this.dismissHint(); // F-515④：离开局面解除活动提示，清理提示定时器与样式
     this.engine = null;
     this.session = null;
     this.spec = null;
@@ -631,6 +703,7 @@ export class GameView {
     const cellCodes = document.getElementById('cell-codes');
     if (cellCodes) cellCodes.classList.add('hidden');
     this.resetViewport();
+    this.invalidateViewSize(); // F-517：棋盘即将随下一局重建，尺寸缓存作废
     window.clearTimeout(this.saveTimer);
     for (const t of this.timers) window.clearInterval(t);
     this.timers = [];
@@ -808,6 +881,7 @@ export class GameView {
     this.btnHelp.title = t('titleHelp');
     this.btnHelp.classList.toggle('off', this.hintsLeft <= 0);
     this.btnHelp.disabled = this.hintsLeft <= 0;
+    if (this.hintTargetId != null) this.checkHintDismissal(); // F-515②：归位 / 锁定即解除
   }
 
   private pieceEl(id: number): HTMLElement | null {
@@ -982,13 +1056,44 @@ export class GameView {
   private pickAt = (clientX: number, clientY: number): HTMLElement | null => {
     const engine = this.engine;
     if (!engine) return null;
+    // F-517：包围盒由引擎状态推算，全场只读一次棋盘 rect——
+    // 原实现对每块逐个 getBoundingClientRect（510~2040 次读，布局脏时拖动拾起顿挫 ~20ms）。
+    // 状态推算与视觉一致：格上块=元素盒（含留白）；散置块=freePos 盒（物理滑行期逐帧同步）。
+    const rect = this.board.getBoundingClientRect();
+    const scale = rect.width / (this.localSize().w || 1);
+    const lx = (clientX - rect.left) / scale;
+    const ly = (clientY - rect.top) / scale;
+    const { w: lw, h: lh } = this.localSize();
+    const cw = lw / this.cols;
+    const ch = lh / this.rows;
+    const { mx, my } = this.marginPx({ width: lw, height: lh });
+    const box = this.freePieceBox();
     const candidates: Array<{ el: HTMLElement; z: number; dom: number }> = [];
     engine.getPieces().forEach((p, index) => {
       if (p.locked) return;
       const el = this.pieceEl(p.id);
       if (!el) return;
-      const rect = el.getBoundingClientRect();
-      if (clientX < rect.left || clientX > rect.right || clientY < rect.top || clientY > rect.bottom) return;
+      let bx: number;
+      let by: number;
+      let bw: number;
+      let bh: number;
+      if (p.cell >= 0) {
+        const col = p.cell % this.cols;
+        const row = Math.floor(p.cell / this.cols);
+        bx = col * cw - mx;
+        by = row * ch - my;
+        bw = cw + mx * 2;
+        bh = ch + my * 2;
+      } else {
+        const pos = this.freePos.get(p.id);
+        if (!pos) return; // 散布尚未完成
+        bx = pos.x;
+        by = pos.y;
+        bw = box.w;
+        bh = box.h;
+      }
+      if (Number(el.dataset.rot) % 2 === 1) [bw, bh] = [bh, bw]; // 旋转 90/270：AA 包围盒宽高互换（shapeHit 精测兜底）
+      if (lx < bx || lx > bx + bw || ly < by || ly > by + bh) return;
       if (!this.shapeHit(el, p.id, clientX, clientY)) return;
       candidates.push({ el, z: Number(el.style.zIndex || 0), dom: index });
     });
@@ -1034,6 +1139,7 @@ export class GameView {
 
   private canPick = (pieceId: number): boolean => {
     if (!this.engine || this.engine.isSolved || this.animating) return false;
+    if (pieceId === this.hintTargetId) this.suppressHintDuringDrag(); // F-515①：拾起仅暂隐块辉光与箭头，目标格保持到放置结算
     const ok = !this.engine.piece(pieceId).locked;
     if (ok) playTone('pick', this.settings.soundOn);
     return ok;
@@ -1175,6 +1281,7 @@ export class GameView {
     const moved = Math.hypot(dx, dy) > 2;
     if (p.cell >= 0 && !moved && px >= 0 && px <= lw && py >= 0 && py <= lh) {
       this.restTransform(el);
+      this.checkHintDismissal(); // 无操作也是一次放置结算：F-515① 归位即解除 / 未归位即恢复提示
       return;
     }
     if (p.cell >= 0) engine.scatterPiece(pieceId);
@@ -1191,6 +1298,7 @@ export class GameView {
     // 瞬时清掉拖拽位移（left 已是最终位置，视觉无跳变），随后平滑缩回
     this.jumpTo(el, `scale(1.04)${this.poseSuffix(el)}`);
     this.rAF(() => this.restTransform(el));
+    this.checkHintDismissal(); // 放置未归位：立即恢复提示辉光（syncPieces 稍后复查为无操作）
     this.later(() => this.syncPieces(), ANIM_MS);
     playTone('drop', this.settings.soundOn);
     this.scheduleSave();
@@ -1331,6 +1439,7 @@ export class GameView {
         }
       }
     }
+    if (this.hintTargetId != null) this.updateHintArrow(); // F-514：物理滑行期箭头低频跟随（内部节流）
     if (phys.isSettled && this.physHeldId === null) {
       this.commitPhysAnchors();
       this.physRunning = false;
@@ -1427,19 +1536,32 @@ export class GameView {
     this.showCellHint(info.cell);
   };
 
+  /** 两个落点提示元素的格尺寸：仅在实际变化时写几何（F-517：几何写会脏化整棵棋盘布局） */
+  private ensureCellHintSize(): { cw: number; ch: number } {
+    const { w: lw, h: lh } = this.localSize();
+    const cw = lw / this.cols;
+    const ch = lh / this.rows;
+    if (this.cellHintW !== cw || this.cellHintH !== ch) {
+      for (const el of [this.dropHintEl, this.hintCellEl]) {
+        el.style.width = `${cw}px`;
+        el.style.height = `${ch}px`;
+      }
+      this.cellHintW = cw;
+      this.cellHintH = ch;
+    }
+    return { cw, ch };
+  }
+
   private showCellHint(cell: number): void {
+    const { cw, ch } = this.ensureCellHintSize();
     const col = cell % this.cols;
     const row = Math.floor(cell / this.cols);
-    const cellHint = must(document.getElementById('drop-hint'), '#drop-hint');
-    cellHint.style.width = `${100 / this.cols}%`;
-    cellHint.style.height = `${100 / this.rows}%`;
-    cellHint.style.left = `${(col * 100) / this.cols}%`;
-    cellHint.style.top = `${(row * 100) / this.rows}%`;
-    cellHint.classList.remove('hidden');
+    this.dropHintEl.style.transform = `translate(${col * cw}px, ${row * ch}px)`; // F-517：transform 不触发布局
+    this.dropHintEl.classList.remove('hidden');
   }
 
   private hideCellHint(): void {
-    document.getElementById('drop-hint')?.classList.add('hidden');
+    this.dropHintEl.classList.add('hidden');
   }
 
   private rotate = (pieceId: number): void => {
@@ -1551,6 +1673,7 @@ export class GameView {
   }
 
   private celebrate(): void {
+    this.dismissHint(); // F-515④：解出即解除
     this.board.classList.add('solved');
     this.stats.pause();
     const engine = must(this.engine, '引擎未初始化');
@@ -1617,24 +1740,191 @@ export class GameView {
     a.click();
   }
 
-  // ---------- 提示（F-304） ----------
+  // ---------- 提示（F-304 / V1.5 F-514~F-516） ----------
+
+  /** 智能选块（F-516）：优先「仅旋转错误（双击即完成）」与「目标格空闲」的块，同级随机 */
+  private pickHintTarget(): number | null {
+    const engine = this.engine;
+    if (!engine) return null;
+    const rotOnly: number[] = [];
+    const freeTarget: number[] = [];
+    const rest: number[] = [];
+    for (const p of engine.getPieces()) {
+      if (p.locked) continue;
+      if (p.cell === p.id && p.rot !== 0) {
+        rotOnly.push(p.id); // 仅旋转错误：双击即可完成
+      } else if (p.cell !== p.id) {
+        (this.cellOccupied(p.id, p.id) ? rest : freeTarget).push(p.id); // 目标格空闲者优先
+      }
+    }
+    const pool = rotOnly.length || freeTarget.length ? [...rotOnly, ...freeTarget] : rest;
+    if (!pool.length) return null;
+    return pool[Math.floor(Math.random() * pool.length)];
+  }
 
   private useHint(): void {
     const engine = this.engine;
     if (!engine || this.hintsLeft <= 0 || engine.isSolved || this.animating) return;
-    const candidates = engine.getPieces().filter((p) => !p.locked && (p.cell !== p.id || p.rot !== 0));
-    if (!candidates.length) return;
+    const targetId = this.pickHintTarget();
+    if (targetId == null) return; // 无可提示块不消耗次数
+    this.dismissHint(); // F-515③：再次使用即替换旧提示，全场同时最多一个活动提示
     this.hintsLeft -= 1;
-    const target = candidates[Math.floor(Math.random() * candidates.length)];
-    const el = this.pieceEl(target.id);
-    if (el) {
-      el.classList.add('hinted');
-      this.later(() => el.classList.remove('hinted'), 2000);
-    }
-    this.showCellHint(target.id);
-    this.later(() => this.hideCellHint(), 2000);
+    this.hintTargetId = targetId;
+    const el = this.pieceEl(targetId);
+    el?.classList.add('hinted');
+    if (el && engine.piece(targetId).rot !== 0) this.addHintBadge(el); // F-516：需旋转的块给角标
+    this.showHintCell(targetId);
+    // F-515：前 2s 强化脉冲，之后转常亮持续至解除
+    this.hintHoldTimer = window.setTimeout(() => {
+      this.hintHoldTimer = 0;
+      const holdEl = this.pieceEl(targetId);
+      holdEl?.classList.remove('hinted');
+      holdEl?.classList.add('hinted-hold');
+      this.hintCellEl.classList.remove('hint-pulse');
+      this.hintCellEl.classList.add('hint-hold');
+    }, HINT_PULSE_MS);
+    // F-514：边缘箭头 1s 兜底刷新；平移 / 缩放 / resize / 物理滑行走事件驱动
+    this.hintArrowLast = 0;
+    this.hintArrowTimer = window.setInterval(() => this.updateHintArrow(), HINT_ARROW_FALLBACK_MS);
+    this.updateHintArrow();
     this.syncPieces();
     this.scheduleSave();
+  }
+
+  /** 解除当前提示（F-515）：统一清理定时器 / 样式类 / 角标 / 目标格高亮 / 边缘箭头，可重复调用 */
+  private dismissHint(): void {
+    window.clearTimeout(this.hintHoldTimer);
+    window.clearInterval(this.hintArrowTimer);
+    this.hintHoldTimer = 0;
+    this.hintArrowTimer = 0;
+    this.hintPickedUp = false;
+    if (this.hintTargetId != null) {
+      this.pieceEl(this.hintTargetId)?.classList.remove('hinted', 'hinted-hold');
+      this.hintTargetId = null;
+    }
+    this.hintBadgeEl?.remove();
+    this.hintBadgeEl = null;
+    this.hintCellEl.classList.add('hidden');
+    this.hintCellEl.classList.remove('hint-pulse', 'hint-hold');
+    this.arrowEl.classList.add('hidden');
+  }
+
+  /**
+   * F-515① 拾起被提示块：目标格高亮保持（用户要求「放到正确位置提示才消失」）——
+   * 仅暂隐块辉光与角标（拖拽块自身已有拿起态样式），目标格转常亮（脉冲定时器终止，防止拖拽中途翻类），
+   * 箭头隐藏（块就在指针上）；解除 / 恢复由放置结算 checkHintDismissal 决定。
+   */
+  private suppressHintDuringDrag(): void {
+    window.clearTimeout(this.hintHoldTimer);
+    this.hintHoldTimer = 0;
+    this.hintPickedUp = true;
+    const el = this.pieceEl(this.hintTargetId!);
+    el?.classList.remove('hinted', 'hinted-hold');
+    this.hintBadgeEl?.remove();
+    this.hintBadgeEl = null;
+    this.hintCellEl.classList.remove('hint-pulse');
+    this.hintCellEl.classList.add('hint-hold'); // 拖拽期间目标格常亮
+    this.arrowEl.classList.add('hidden');
+  }
+
+  /** F-515① 放置未成功：恢复被提示块辉光（与角标），目标格已处常亮态，提示继续生效 */
+  private restoreHintAfterDrop(): void {
+    this.hintPickedUp = false;
+    const id = this.hintTargetId;
+    const engine = this.engine;
+    if (id == null || !engine) return;
+    const el = this.pieceEl(id);
+    el?.classList.add('hinted-hold');
+    if (el && engine.piece(id).rot !== 0) this.addHintBadge(el);
+  }
+
+  /** F-515② 解除条件：被提示块归位 / 锁定后自动解除（syncPieces 与旋转后调用）；手持中放置未成功则恢复提示 */
+  private checkHintDismissal(): void {
+    const engine = this.engine;
+    const id = this.hintTargetId;
+    if (!engine || id == null) return;
+    const p = engine.piece(id);
+    if (p.locked || (p.cell === id && (!engine.rotationEnabled || p.rot === 0))) this.dismissHint();
+    else if (this.hintPickedUp) this.restoreHintAfterDrop();
+  }
+
+  /** 提示的目标格高亮（F-515）：与拖拽落点提示 #drop-hint 相互独立，可同时显示 */
+  private showHintCell(cell: number): void {
+    const { cw, ch } = this.ensureCellHintSize();
+    const col = cell % this.cols;
+    const row = Math.floor(cell / this.cols);
+    this.hintCellEl.style.transform = `translate(${col * cw}px, ${row * ch}px)`; // F-517：transform 不触发布局
+    this.hintCellEl.classList.remove('hidden', 'hint-hold');
+    this.hintCellEl.classList.add('hint-pulse');
+  }
+
+  private addHintBadge(el: HTMLElement): void {
+    this.hintBadgeEl?.remove();
+    const badge = document.createElement('div');
+    badge.className = 'hint-rot-badge';
+    badge.textContent = '🔄';
+    el.appendChild(badge);
+    this.hintBadgeEl = badge;
+  }
+
+  // ---------- 提示寻块指引（F-514） ----------
+
+  /** 被提示块中心的棋盘局部坐标（格上块 = 格中心；散置块 = 含留白的元素中心，物理滑行期随 freePos 实时更新） */
+  private pieceCenterLocal(id: number): { x: number; y: number } {
+    const engine = must(this.engine, '引擎未初始化');
+    const p = engine.piece(id);
+    if (p.cell >= 0) {
+      const { w: lw, h: lh } = this.localSize();
+      return {
+        x: ((p.cell % this.cols) + 0.5) * (lw / this.cols),
+        y: (Math.floor(p.cell / this.cols) + 0.5) * (lh / this.rows),
+      };
+    }
+    const pos = this.freePos.get(id);
+    const box = this.freePieceBox();
+    return { x: (pos?.x ?? 0) + box.w / 2, y: (pos?.y ?? 0) + box.h / 2 };
+  }
+
+  /** 视口外指引箭头：贴视口边缘指向被提示块，回屏即消失；事件驱动 + 1s 兜底，内部 120ms 节流 */
+  private updateHintArrow(): void {
+    const engine = this.engine;
+    const id = this.hintTargetId;
+    if (!engine || id == null) return;
+    const now = performance.now();
+    if (now - this.hintArrowLast < 120) return;
+    this.hintArrowLast = now;
+    const p = engine.piece(id);
+    if (p.locked || (p.cell === id && (!engine.rotationEnabled || p.rot === 0))) {
+      this.arrowEl.classList.add('hidden');
+      return;
+    }
+    if (this.hintPickedUp) {
+      this.arrowEl.classList.add('hidden'); // 块在指针 / 键盘手持中：箭头无意义（F-515①）
+      return;
+    }
+    const rect = this.board.getBoundingClientRect();
+    const scale = this.scaleFactor();
+    const c = this.pieceCenterLocal(id);
+    const cx = rect.left + c.x * scale;
+    const cy = rect.top + c.y * scale;
+    const wrapRect = this.wrap.getBoundingClientRect();
+    const pad = 20; // 贴边留白
+    if (
+      cx >= wrapRect.left + pad &&
+      cx <= wrapRect.right - pad &&
+      cy >= wrapRect.top + pad &&
+      cy <= wrapRect.bottom - pad
+    ) {
+      this.arrowEl.classList.add('hidden'); // 已在视口内：仅保留持续高亮（F-515）
+      return;
+    }
+    const px = Math.min(wrapRect.right - pad, Math.max(wrapRect.left + pad, cx)) - wrapRect.left;
+    const py = Math.min(wrapRect.bottom - pad, Math.max(wrapRect.top + pad, cy)) - wrapRect.top;
+    const angle = (Math.atan2(cy - (wrapRect.top + py), cx - (wrapRect.left + px)) * 180) / Math.PI;
+    this.arrowEl.style.left = `${px}px`;
+    this.arrowEl.style.top = `${py}px`;
+    this.arrowEl.style.transform = `translate(-50%, -50%) rotate(${angle.toFixed(1)}deg)`;
+    this.arrowEl.classList.remove('hidden');
   }
 
   // ---------- 设置 ----------
@@ -1665,6 +1955,7 @@ export class GameView {
 
   private restart(): void {
     if (!this.engine || this.animating) return; // 动画进行中不重开（避免开场序列重叠）
+    this.dismissHint(); // F-515④：重开解除活动提示
     this.commitPhysAnchors(); // 物理运动中重开：先把锚点位移落盘再重散布（F-513）
     this.board.classList.remove('solved');
     this.engine.reshuffle();
@@ -1708,13 +1999,34 @@ export class GameView {
     }
     this.board.style.width = `${Math.floor(w)}px`;
     this.board.style.height = `${Math.floor(h)}px`;
+    this.invalidateViewSize(); // 尺寸落盘后失效缓存（F-517），下一次 localSize 重读新值
+    this.invalidateVpGeom(); // 布局尺寸 / 布局原点变化，视口手势几何缓存失效（F-519）
   }
 
   // ---------- 自由摆放散布 ----------
 
-  /** 棋盘局部像素尺寸（layout 单位；块定位、散布、吸附判定全部使用该坐标系） */
+  /** 棋盘局部像素尺寸（layout 单位；块定位、散布、吸附判定全部使用该坐标系）。
+   *  F-517：热路径（跨格悬停 / 拖拽 / 物理循环 / 命中测试）改读缓存——
+   *  offsetWidth 在布局脏时会强制同步重排全棋盘子树（510~2040 块），
+   *  原实现使每次跨格 hover 都触发一次全盘布局，缩小视口后跨格更频直接卡顿。
+   *  缓存仅在 fitBoard（含 resize）/ mount 后失效重读；平移缩放是 transform，不影响该值。 */
+  private viewW = 0;
+  private viewH = 0;
+  /** 落点提示元素已写入的格尺寸缓存：格尺寸未变时不重写几何（F-517） */
+  private cellHintW = 0;
+  private cellHintH = 0;
+
   private localSize(): { w: number; h: number } {
-    return { w: this.board.offsetWidth, h: this.board.offsetHeight };
+    if (this.viewW === 0 || this.viewH === 0) {
+      this.viewW = this.board.offsetWidth;
+      this.viewH = this.board.offsetHeight;
+    }
+    return { w: this.viewW, h: this.viewH };
+  }
+
+  private invalidateViewSize(): void {
+    this.viewW = 0;
+    this.viewH = 0;
   }
 
   /** 自由模式下块的实际占位（含异形留白），用于散布与夹取 */
